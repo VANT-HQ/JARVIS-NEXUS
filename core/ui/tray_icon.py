@@ -1,0 +1,151 @@
+# core/ui/tray_icon.py #? (Hmody: last thing i want to see is someone mocking me coz he couldn't summon panel via STT)
+"""
+System Tray Icon (Headless Gateway)
+===================================
+Provides a lightweight, persistent System Tray interface for JARVIS.
+This module acts as the primary user gateway in headless mode, offering:
+  - Real-time dynamic state polling (via Hover Tooltip)
+  - JARVIS NEXUS Website access (Default Action)
+  - Settings Panel and Environment Setup Wizard integration
+  - Emergency Immediate Exit
+"""
+
+import pystray
+from PIL import Image, ImageDraw
+import threading
+import sys
+import os
+import subprocess
+import time
+import webbrowser
+
+def create_tray_icon(jarvis_engine):
+    """
+    Creates and runs the System Tray icon for JARVIS.
+    """
+    # 1. State string generator
+    def get_state_text():
+        if not jarvis_engine.initialization_complete:
+            return "🚀 JARVIS: Starting up..."
+        
+        state = jarvis_engine.state.interrupt_state
+        if state == "processing":
+            return "🧠 JARVIS: Thinking..."
+        elif state == "speaking":
+            return "🗣️ JARVIS: Speaking / Busy..."
+        elif state == "follow_up":
+            return "👂 JARVIS: Listening (Follow-up)..."
+        elif getattr(jarvis_engine.state, 'always_listening', False):
+            return "👂 JARVIS: Always Listening..."
+        elif getattr(jarvis_engine.ears, 'is_listening', False):
+            return "👂 JARVIS: Background Listening..."
+        return "💤 JARVIS: Idle"
+
+    def update_tooltip(icon):
+        """Continuously update the tooltip to reflect JARVIS's current state."""
+        icon.visible = True
+        # jarvis_engine.running is False during the 17s startup sequence.
+        # We must use 'while True' so the thread doesn't exit immediately!
+        while True:
+            try:
+                new_text = get_state_text()
+                if icon.title != new_text:
+                    icon.title = new_text
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def on_open_website(icon, item):
+        try:
+            webbrowser.open("https://vanthq.net/jarvis")
+        except Exception as e:
+            pass
+
+    def on_open_settings(icon, item):
+        print("\n⚙️ [Tray] Opening Settings Panel...")
+        try:
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([sys.executable, "--settings"])
+            elif "__compiled__" in globals():
+                subprocess.Popen([sys.argv[0], "--settings"])
+            else:
+                settings_script = os.path.join(os.path.dirname(__file__), "settings_panel.py")
+                subprocess.Popen([sys.executable, settings_script])
+        except Exception as e:
+            print(f"Tray error opening settings: {e}")
+
+    def on_open_setup(icon, item):
+        print("\n🛠️ [Tray] Opening Environment Setup Wizard...")
+        try:
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([sys.executable, "--setup"])
+            elif "__compiled__" in globals():
+                subprocess.Popen([sys.argv[0], "--setup"])
+            else:
+                setup_script = os.path.join(os.path.dirname(__file__), "..", "bootstrap", "env_setup.py")
+                subprocess.Popen([sys.executable, setup_script])
+        except Exception as e:
+            print(f"Tray error opening setup: {e}")
+
+    def on_exit(icon, item):
+        print("\n🛑 [Tray] Immediate Exit triggered...")
+        icon.stop()
+        if jarvis_engine:
+            jarvis_engine.running = False
+            # Attempt to unload Ollama models immediately before exiting
+            try:
+                if hasattr(jarvis_engine, 'llm_client') and jarvis_engine.llm_client:
+                    import requests
+                    base_url = getattr(jarvis_engine.llm_client, 'base_url', "http://localhost:11434")
+                    models_to_unload = set([getattr(jarvis_engine.llm_client, 'normal_model', None), getattr(jarvis_engine.llm_client, 'overthink_model', None)])
+                    for model in models_to_unload:
+                        if model:
+                            requests.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
+            except Exception:
+                pass
+            os._exit(0)
+
+    # 1. Load an Icon (from standardized TRAY_ICON_PATH)
+    try:
+        from core.config import TRAY_ICON_PATH
+        from pathlib import Path
+        icon_path = Path(TRAY_ICON_PATH)
+        
+        if icon_path.exists():
+            image = Image.open(icon_path)
+            width, height = image.size
+            if width != height:
+                min_dim = min(width, height)
+                left = (width - min_dim)/2
+                top = (height - min_dim)/2
+                right = (width + min_dim)/2
+                bottom = (height + min_dim)/2
+                image = image.crop((left, top, right, bottom))
+        else:
+            raise FileNotFoundError("Icon not found")
+            
+    except Exception:
+        # Fallback dynamic image
+        image = Image.new('RGB', (64, 64), color=(0, 102, 204))
+        d = ImageDraw.Draw(image)
+        d.text((10, 25), "NEXUS", fill=(255, 255, 255))
+
+    # 2. Construct the Dynamic Menu
+    menu = pystray.Menu(
+        pystray.MenuItem('JARVIS NEXUS', on_open_website, default=True),
+
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('⚙️ Open Settings', on_open_settings),
+        pystray.MenuItem('🛠️ Env Setup Wizard', on_open_setup),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('🛑 Immediate Exit', on_exit)
+    )
+
+    # 3. Run the icon with continuous state polling
+    icon = pystray.Icon("JARVIS", image, get_state_text(), menu)
+    icon.run(setup=update_tooltip)
+
+def start_tray(jarvis_engine):
+    """Spawns the tray icon in a dedicated daemon thread."""
+    tray_thread = threading.Thread(target=create_tray_icon, args=(jarvis_engine,), daemon=True, name="TrayIconThread")
+    tray_thread.start()

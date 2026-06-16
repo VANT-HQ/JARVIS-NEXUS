@@ -1,28 +1,31 @@
+PyQt5==5.15.11
+pygame==2.6.1
+pywebview==6.2.1
 
-# Core
-numpy>=1.24.0
-requests>=2.28.0
-pygame>=2.5.0
+faster-whisper==1.2.1
+SpeechRecognition==3.14.5
+piper-tts==1.4.1
+faiss-cpu==1.14.2
 
-# AI / ML
-faster-whisper>=1.0.0
-sentence-transformers>=2.2.0
-ollama>=0.1.0
+beautifulsoup4==4.14.3
+requests==2.32.5
+curl_cffi==0.14.0
 
-# TTS
-piper-tts>=1.2.0; platform_system=="Linux" or platform_system=="Windows"
-edge-tts>=6.1.0
-pyttsx3>=2.90
+PyAutoGUI==0.9.54
+Pillow==10.4.0
+pystray==0.19.5
+psutil==7.2.2
+screen-brightness-control==0.27.1
 
-# Browser & Web
-scrapling>=0.1.0
-patchright>=1.40.0
-duckduckgo-search>=3.9.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
+numpy==2.4.2
+thefuzz==0.19.0
+gguf==0.19.0
 
-# Data
-tinytag>=1.10.0
+pyaudio==0.2.14
+python-Levenshtein==0.27.3
+duckduckgo-search==8.1.1
+ddgs==9.14.4
+pycaw==20251023
+comtypes==1.4.16
 
-# Utilities
-python-dateutil>=2.8.0
+
