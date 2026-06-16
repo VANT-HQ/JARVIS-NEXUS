@@ -581,7 +581,7 @@ This project is open-source. See [`LICENSE`](LICENSE) for full terms.
 <br>
 
 *<a href="https://vanthq.net">
-  <img src="https://vanthq.net/public/favicon.ico" alt="V.A.N.T." style="height: 1em; vertical-align: middle;">
+  <img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." style="height: 1em; vertical-align: middle;">
 </a> open-source project.*
 
 </div>
