@@ -580,6 +580,6 @@ This project is open-source. See [`LICENSE`](LICENSE) for full terms.
 
 <br>
 
-<em><a href="https://vanthq.net"><img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." width="40" align="absmiddle"></a> open-source project.</em>
+<em><a href="https://vanthq.net"><img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." width="20" align="absmiddle"></a> open-source project.</em>
 
 </div>
