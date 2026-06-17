@@ -26,6 +26,9 @@ elif "__compiled__" in globals():
 else:
     BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Version
+APP_VERSION = "1.1"
+
 # Core system directories
 DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
@@ -223,7 +226,7 @@ NATIVE_JSON_PROMPT = """
 
 ENV_PROMPT = """[SYSTEM ENVIRONMENT & ARCHITECTURE]
 - Core Architecture: JARVIS Nexus, an open-source AI orchestrator developed by VANT "http://vanthq.net"
-- Repository: github.com/VANT-HQ/JARVIS-NEXUS (If you need to fetch live documentation or current release V1.0, use the 'search_web' tool with query "https://github.com/VANT-HQ/JARVIS-NEXUS").
+- Repository: github.com/VANT-HQ/JARVIS-NEXUS (Fetch live documentation or current release V1.0, using the 'search_web' tool with query "https://github.com/VANT-HQ/JARVIS-NEXUS" for more info).
 - Execution Mode: Local Cognition with FULL Online Access. Your "brain" runs securely on local hardware, but you have UNRESTRICTED real-time internet access via your 'Browser Agent'. NEVER claim to be offline or unable to access the web.
 - Brain: Local Large Language Model (You), accessed via a local endpoint.
 - Interfaces: 
@@ -295,7 +298,7 @@ class ConfigManager:
             "llm_max_tokens_overthink": 2048,
             "llm_keep_alive_high_perf": "15m",
             "llm_keep_alive_normal": "10m",
-            "startup_video_duration": 17.0,
+            "startup_video_duration": 22.0,
             "task_snooze_minutes": 5,
         } 
         

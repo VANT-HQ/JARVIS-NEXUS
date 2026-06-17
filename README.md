@@ -9,7 +9,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-000000?style=for-the-badge)](https://ollama.com)
-[![Status](https://img.shields.io/badge/Status-Stable%20v1.0-brightgreen?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases)
+[![Status](https://img.shields.io/badge/Status-%20v1.1-brightgreen?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases)
 [![Download EXE](https://img.shields.io/badge/Download-Windows%20.exe-blue?style=for-the-badge&logo=windows)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases/latest)
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome%20on%20dev-0075ca?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/tree/dev)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=for-the-badge)](#-hardware-requirements)
@@ -37,6 +37,21 @@ JARVIS NEXUS is a fully autonomous, locally-hosted AI assistant that runs as an 
 While competitors demand 8GB+ VRAM for agentic workflows, **NEXUS is meticulously engineered to run flawlessly on just 4GB VRAM**, maintaining near-zero Time-To-First-Token (TTFT) through advanced KV-Cache pre-baking. 
 
 What sets it apart is the **NEXUS Architecture**: a dual-layer message system that pre-bakes the system prompt and tool schemas into Ollama's KV-Cache at startup, achieving near-zero TTFT on every interaction — even the very first one.
+
+## 🚀 What's New in v1.1 (Stability & Executable Update)
+<!--? (Hmody: admit it was a bugs  ❌, we are introducing to you the v1.1 release🎉  ✅) -->
+This release focuses heavily on deep architectural improvements to ensure flawless, crash-free execution in the compiled `Windowless Executable (.exe)` environment.
+
+* **Deterministic Boot Sequence:** Removed fragile timeouts. JARVIS now waits for actual LLM readiness with strict null-safety, guaranteeing 100% boot reliability without `NoneType` crashes.
+* **Subprocess Isolation:** Background operations (like Ollama) are now fully isolated with outputs routed to `DEVNULL`. This permanently eliminates buffer-overflow deadlocks and freezing in the standalone executable.
+* **Thread-Safe GUI Fallbacks:** Replaced crash-prone `tkinter` daemon-thread calls with a smart PowerShell/WinForms fallback, preventing system freezes during model rebuild prompts.
+* **Interactive System Tray:** The tray icon now features live state syncing (e.g., *Building Model*, *Warming Cache*), Quick/Full Restart options, and a context-aware, guard-protected "Rebuild Model" action.
+* **CUDA Environment Inheritance:** Background processes now perfectly inherit system environment variables (`os.environ.copy()`), ensuring Ollama reliably detects your GPU even when launched via the silent background daemon.
+
+<!-- > 🌐 **For the full technical changelog and deep-dive details, visit [vanthq.net/jarvisnexus](https://vanthq.net/jarvisnexus).** -->
+<!--? (Hmody: i cant do more code, i realy need a break 😭😭😭) -->
+
+---
 
 ## 👥 Core Team & Contributors
 JARVIS NEXUS is proudly developed by the V.A.N.T. team and the open-source community.
@@ -567,7 +582,7 @@ This project is open-source. See [`LICENSE`](LICENSE) for full terms.
  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝    ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
 ```
 
-**JARVIS NEXUS v1.0** — *Stable Release*
+**JARVIS NEXUS v1.1** — *First Release*
 
 <br>
 
@@ -580,6 +595,6 @@ This project is open-source. See [`LICENSE`](LICENSE) for full terms.
 
 <br>
 
-<em><a href="https://vanthq.net"><img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." width="20" align="absmiddle"></a> open-source project.</em>
+<em><a href="https://vanthq.net"><img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." width="30" align="absmiddle"></a> open-source project.</em>
 
 </div>

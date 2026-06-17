@@ -460,7 +460,7 @@ button:active{transform:scale(.97)}
       <div class="logo">⚙ JARVIS <span>NEXUS</span></div>
       <div class="sub">Configuration Manager - v0.1 alpha</div>
     </div>
-    <div class="badge">v1.0</div>
+    <div class="badge">v1.1</div>
   </div>
 
   <!-- Body -->
@@ -1607,10 +1607,18 @@ def launch():
         print("Settings panel is already open.")
         return
 
+    from core.config import get_setting
+    app_version = get_setting('app_version', '1.1')
+    
+    html_content = HTML.replace(
+        '<div class="badge">v1.1</div>', 
+        f'<div class="badge">v{app_version}</div>'
+    )
+
     api = API()
     window = webview.create_window(
         title       = "JARVIS NEXUS · Settings",
-        html        = HTML,
+        html        = html_content,
         js_api      = api,
         width       = 1000,
         height      = 700,

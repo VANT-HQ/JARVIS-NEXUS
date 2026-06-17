@@ -423,24 +423,6 @@ class BrowsingTool:
             'suggestion': 'Execute operations directly via raw targeted HTTP Form Actions or REST payloads.'
         }
     
-    # -----------------------------------------------------------------
-    # Information Extraction and Processing Utilities
-    # -----------------------------------------------------------------
-    def _extract_attribute(self, text: str, attribute: str) -> Optional[str]:
-        """Helper to match structural pattern data inside raw extracted text blocks."""
-        patterns = {
-            'bundle_size': r'(\d+\.?\d*\s*(?:kb|mb|KB|MB))',
-            'popularity': r'(\d+[,\d]*)\s*(?:downloads|stars|users)',
-            'version': r'v?(\d+\.\d+\.?\d*)',
-            'price': r'\$(\d+\.?\d*)'
-        }
-        
-        if attribute.lower() in patterns:
-            match = re.search(patterns[attribute.lower()], text, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-    
     def _extract_key_facts(self, text: str, topic: str, max_facts: int = 5) -> List[str]:
         """Extracts text sentences matching conversational topic markers."""
         if not text or len(text.strip()) < 10:
@@ -465,45 +447,3 @@ class BrowsingTool:
             return sentences[:max_facts]
             
         return relevant_sentences[:max_facts]
-
-
-# =====================================================================
-# Core JARVIS Integration Routing Interface
-# =====================================================================
-class BrowsingToolAPI:
-    """System-wide abstraction layer to process engine web browsing requests."""
-    
-    def __init__(self, memory_manager=None):
-        self.tool = BrowsingTool(memory_manager)
-    
-    def execute(self, mode: BrowserMode, params: Dict) -> Dict:
-        try:
-            if mode == BrowserMode.QUICK_SEARCH:
-                return self.tool.quick_search(**params)
-            
-            elif mode == BrowserMode.DEEP_RESEARCH:
-                return self.tool.deep_research(**params)
-            
-            elif mode == BrowserMode.ACTIVE_MONITOR:
-                action = params.pop('action', 'setup')
-                if action == 'setup':
-                    task_id = self.tool.setup_monitor(**params)
-                    return {'success': True, 'task_id': task_id}
-                elif action == 'check':
-                    return self.tool.run_monitor_check(params['task_id'])
-            
-            elif mode == BrowserMode.RPA_TASK:
-                return self.tool.execute_rpa_task(**params)
-            
-            else:
-                return {
-                    'success': False,
-                    'error': f'Invalid operating browser mode: {mode}'
-                }
-                
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'mode': mode
-            }

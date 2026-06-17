@@ -57,7 +57,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-
+ 
 
 # =================================================================
 # LLM Client (Ollama Engine - Dual Model Support & Auto-Build)
@@ -96,19 +96,20 @@ class LLMClient:
             pass
 
         time.sleep(1)
-
+ 
         try:
             # Start Ollama serve in the background
+            env = os.environ.copy()
             if platform.system() == "Windows":
                 subprocess.Popen(
                     ['ollama', 'serve'],
                     shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW
+                    creationflags=subprocess.CREATE_NO_WINDOW, env=env
                 )
             else:
                 subprocess.Popen(
                     ['ollama', 'serve'],
-                    shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
                 )
                 
             print("⏳ Booting fresh Ollama instance...")
@@ -246,8 +247,31 @@ class LLMClient:
         # Fallback: Rely purely on file size if GGUF is unreadable or unavailable
         return file_size_gb
 
-    def _ensure_model_exists(self):
-        """Discovers GGUF models dynamically, respects DB config, and auto-builds them in Ollama."""
+    @property
+    def has_auto_template(self) -> bool:
+        """Returns True if the main model matches a known auto-template."""
+        try:
+            llm_dir = LLM_DIR
+            gguf_files = list(llm_dir.glob("*.gguf"))
+            if not gguf_files: return False
+            configured_main = get_setting("main_llm", "auto_max")
+            gguf_files.sort(key=lambda x: self._calculate_model_score(x))
+            normal_file = next((f for f in gguf_files if f.name == configured_main), gguf_files[-1])
+            for family_name, config_data in MODEL_TEMPLATES.items():
+                if any(keyword in normal_file.name.lower() for keyword in config_data.get("keywords", [])):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _ensure_model_exists(self, force_manual: bool = False) -> bool:
+        """
+        Validates the presence of required GGUF files and builds them in Ollama if missing.
+        Optionally displays a Template Builder GUI if native templates are unavailable.
+        Returns:
+            bool: True if the user aborted any model rebuild via the GUI, False otherwise.
+        """
+        aborted = False
         llm_dir = LLM_DIR
 
         while True:
@@ -291,9 +315,12 @@ class LLMClient:
             # 5. Check currently installed Ollama models
             import tempfile
             with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as temp_out:
+                kwargs = {}
+                if platform.system() == "Windows":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 subprocess.run(
                     ['ollama', 'list'], 
-                    stdout=temp_out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True
+                    stdout=temp_out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, **kwargs
                 )
                 temp_out.seek(0)
                 installed_models = temp_out.read().lower()
@@ -307,16 +334,22 @@ class LLMClient:
                     clean_name = model_name.replace(':latest', '')
                     if clean_name not in required_models:
                         print(f"🗑️ Removing old/unused system model: {clean_name}")
+                        kwargs = {}
+                        if platform.system() == "Windows":
+                            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                         subprocess.run(
                             ['ollama', 'rm', clean_name],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs
                         )
 
             # 7. Register new models via Modelfile if they don't exist
             for mod_name, mod_file in required_models.items():
-                if mod_name not in installed_models:
-                    print(f"⚠️ Model '{mod_name}' not found in Ollama. Starting Auto-Setup...")
-                    logger.warning(f"Model '{mod_name}' not found in Ollama. Starting Auto-Setup...")
+                
+                # force_manual is overloaded here as the rebuild_target. If it's a string, it's the target model name to rebuild.
+                target_rebuild = force_manual if isinstance(force_manual, str) else None
+                
+                if (mod_name not in installed_models) or (mod_name == target_rebuild):
+                    print(f"⚠️ Model '{mod_name}' needs to be built. Starting Setup...")
                     modelfile_path = llm_dir / f"Modelfile_{mod_name}"
                     try:
                         # Dynamic Template Matching Engine
@@ -327,37 +360,47 @@ class LLMClient:
                         for family_name, config_data in MODEL_TEMPLATES.items():
                             if any(keyword in mod_file.name.lower() for keyword in config_data.get("keywords", [])):
                                 matched_config = config_data
-                                print(f"🧠 [Auto-Config] Detected '{family_name}' model family based on name.")
                                 break
                         
-                        if matched_config:
-                            print(f"⚙️ Injecting Native Multi-Tool Template for {family_name.upper()}...")
-                            modelfile_content += f'TEMPLATE """{matched_config.get("template", "")}"""\n\n'
-                            
-                            for param in matched_config.get("parameters", []):
-                                modelfile_content += f'PARAMETER {param}\n'
-                        else:
-                            # No auto-match -> prompt user via GUI
+                        user_template = None
+                        if target_rebuild == mod_name:
+                            # Explicit rebuild from tray -> ALWAYS open GUI
                             if request_template_from_user is None:
                                 print(f"❌ [Template Builder] module not found. Cannot build '{mod_name}'.")
                                 logger.error(f"[Template Builder] module not found. Cannot build '{mod_name}'.")
                                 continue
-                                
-                            user_template = request_template_from_user(mod_file.name)
+                            user_template = request_template_from_user(mod_file.name, has_auto=bool(matched_config))
                             if user_template is None:
                                 print(f"❌ [Template Builder] User chose EXIT. Model '{mod_name}' will NOT be built.")
                                 logger.warning(f"[Template Builder] User chose EXIT. Model '{mod_name}' will NOT be built.")
-                                print(f"  → To fix this, either:")
-                                print(f"    1. Rename your .gguf file to include a known family (e.g. 'qwen', 'llama3', 'mistral')")
-                                print(f"    2. Add a new entry in core/data/llm_templates.py")
+                                aborted = True
                                 continue
-
+                            if user_template != "__AUTO__":
+                                matched_config = None # Override auto config with manual template
+                        else:
+                            # Initial boot setup
+                            if matched_config:
+                                print(f"🧠 [Auto-Config] Detected '{family_name}' model family based on name.")
+                            else:
+                                if request_template_from_user is None:
+                                    print(f"❌ [Template Builder] module not found. Cannot build '{mod_name}'.")
+                                    logger.error(f"[Template Builder] module not found. Cannot build '{mod_name}'.")
+                                    continue
+                                user_template = request_template_from_user(mod_file.name, has_auto=False)
+                                if user_template is None:
+                                    print(f"❌ [Template Builder] User chose EXIT. Model '{mod_name}' will NOT be built.")
+                                    logger.warning(f"[Template Builder] User chose EXIT. Model '{mod_name}' will NOT be built.")
+                                    aborted = True
+                                    continue
+                        
+                        if matched_config:
+                            print(f"⚙️ Injecting Native Multi-Tool Template for {family_name.upper()}...")
+                            modelfile_content += f'TEMPLATE """{matched_config.get("template", "")}"""\n\n'
+                            for param in matched_config.get("parameters", []):
+                                modelfile_content += f'PARAMETER {param}\n'
+                        elif user_template and user_template != "__AUTO__":
                             print(f"⚙️ [User Template] Injecting user-provided template...")
-
-                            # Clean the user's input before injection
                             _clean_input = user_template.strip()
-
-                            # Strip markdown backticks
                             if _clean_input.startswith("```"):
                                 _input_lines = _clean_input.splitlines()
                                 _input_lines = _input_lines[1:]
@@ -365,7 +408,6 @@ class LLMClient:
                                     _input_lines = _input_lines[:-1]
                                 _clean_input = "\n".join(_input_lines).strip()
 
-                            # Detect if the input is a full Modelfile snippet or raw template
                             _has_modelfile_directives = any(
                                 line.strip().upper().startswith(('TEMPLATE ', 'TEMPLATE\t', 'TEMPLATE"', 'PARAMETER '))
                                 for line in _clean_input.splitlines()
@@ -376,15 +418,30 @@ class LLMClient:
                             else:
                                 modelfile_content += f'TEMPLATE """{_clean_input}"""\n\n'
 
+                        # AT THIS POINT: We have a valid template. We can safely remove the old model.
+                        if mod_name in installed_models:
+                            print(f"🗑️ [Rebuild] Removing old model from Ollama: {mod_name}")
+                            kwargs = {}
+                            if platform.system() == "Windows":
+                                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                            subprocess.run(['ollama', 'rm', mod_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+
                         # Write assembled configuration
                         with open(modelfile_path, "w", encoding="utf-8") as f:
                             f.write(modelfile_content)
                             
                         # Build the model in Ollama
-                        subprocess.run(
+                        kwargs = {}
+                        if platform.system() == "Windows":
+                            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                        result = subprocess.run(
                             ['ollama', 'create', mod_name, '-f', str(modelfile_path)],
-                            check=True
+                            capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL, **kwargs
                         )
+                        if result.returncode != 0:
+                            logger.error(f"❌ ollama create failed:\n{result.stderr}")
+                            print(f"❌ ollama create failed:\n{result.stderr}")
+                            raise RuntimeError(f"Ollama create failed: {result.stderr}")
                         print(f"✅ Model '{mod_name}' successfully integrated into Ollama!")
                     except Exception as e:
                         print(f"❌ Failed to build model {mod_name}. Error: {e}")
@@ -401,6 +458,35 @@ class LLMClient:
         except Exception as e:
             print(f"❌ Ollama model management error: {e}")
             logger.error(f"Ollama model management error: {e}")
+            
+        return aborted
+
+    def rebuild_model_interactive(self, model_name: str = None, mode: str = "smart"):
+        """
+        Rebuilds the target model interactively using the unified Template Builder GUI.
+        Safe to call from a background thread.
+        """
+        target = model_name or self.normal_model
+        if not target:
+            print("⚠️ [Rebuild] No model name to rebuild.")
+            return
+        
+        # We NO LONGER delete the model here! We pass it to _ensure_model_exists as force_manual
+        print("🔨 [Rebuild] Re-running model setup with smart UI...")
+        aborted = self._ensure_model_exists(force_manual=target)
+
+        # Speak completion message safely
+        try:
+            from core.audio.tts_engine import Mouth
+            temp_mouth = Mouth()
+            if aborted:
+                print("❌ [Rebuild] Model rebuild was aborted.")
+                temp_mouth.speak("Model rebuild was aborted, but my current core is still fully operational.")
+            else:
+                print("✅ [Rebuild] Model rebuild complete.")
+                temp_mouth.speak("Model rebuild completed successfully. I am ready.")
+        except Exception as e:
+            print(f"⚠️ [Rebuild] Speech synthesis failed: {e}")
 
     # ------------------------------------------------------------------
     # Private: I/O Interface Parsers

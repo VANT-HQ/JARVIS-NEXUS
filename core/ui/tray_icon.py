@@ -19,6 +19,9 @@ import subprocess
 import time
 import webbrowser
 
+from core.config import get_setting
+_JARVIS_VERSION = get_setting('app_version', '1.0')
+
 def create_tray_icon(jarvis_engine):
     """
     Creates and runs the System Tray icon for JARVIS.
@@ -26,19 +29,29 @@ def create_tray_icon(jarvis_engine):
     # 1. State string generator
     def get_state_text():
         if not jarvis_engine.initialization_complete:
+            phase = getattr(jarvis_engine, '_build_phase', '')
+            if phase == 'building_model':
+                return "🔨 JARVIS: Building Model..."
+            elif phase == 'warming_cache':
+                return "🔥 JARVIS: Warming Cache..."
             return "🚀 JARVIS: Starting up..."
-        
+
         state = jarvis_engine.state.interrupt_state
-        if state == "processing":
+        followup_window = get_setting('followup_window', 10)
+
+        if state == "follow_up":
+            elapsed = time.time() - getattr(jarvis_engine, 'last_speech_time', 0)
+            if elapsed > followup_window:
+                return "💤 JARVIS: Idle"
+            return "👂 JARVIS: Listening (Follow-up)..."
+        elif state == "processing":
             return "🧠 JARVIS: Thinking..."
         elif state == "speaking":
-            return "🗣️ JARVIS: Speaking / Busy..."
-        elif state == "follow_up":
-            return "👂 JARVIS: Listening (Follow-up)..."
+            return "🗣️ JARVIS: Speaking..."
         elif getattr(jarvis_engine.state, 'always_listening', False):
             return "👂 JARVIS: Always Listening..."
         elif getattr(jarvis_engine.ears, 'is_listening', False):
-            return "👂 JARVIS: Background Listening..."
+            return "👂 JARVIS: Listening..."
         return "💤 JARVIS: Idle"
 
     def update_tooltip(icon):
@@ -130,19 +143,77 @@ def create_tray_icon(jarvis_engine):
         d = ImageDraw.Draw(image)
         d.text((10, 25), "NEXUS", fill=(255, 255, 255))
 
+    def _do_restart(kill_ollama: bool):
+        """Shared restart logic."""
+        icon.stop()
+        jarvis_engine.running = False
+        
+        if kill_ollama:
+            try:
+                import requests as _req
+                if hasattr(jarvis_engine, 'llm_client') and jarvis_engine.llm_client:
+                    base_url = getattr(jarvis_engine.llm_client, 'base_url', "http://localhost:11434")
+                    for model in [jarvis_engine.llm_client.normal_model, jarvis_engine.llm_client.overthink_model]:
+                        if model:
+                            _req.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
+                subprocess.run("taskkill /F /IM ollama.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run("taskkill /F /IM ollama_llama_server.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        
+        env = os.environ.copy()
+        if not kill_ollama:
+            env['JARVIS_QUICK_RESTART'] = '1'
+        
+        try:
+            if getattr(sys, 'frozen', False) or "__compiled__" in globals():
+                subprocess.Popen([sys.executable], env=env)
+            else:
+                subprocess.Popen([sys.executable, 'app.py'], env=env)
+        except Exception as e:
+            print(f"⚠️ Restart failed: {e}")
+        
+        os._exit(0)
+
+    def on_full_restart(icon, item):
+        print("🔄 [Tray] Full Restart triggered...")
+        threading.Thread(target=_do_restart, args=(True,), daemon=True).start()
+
+    def on_quick_restart(icon, item):
+        print("⚡ [Tray] Quick Restart triggered...")
+        threading.Thread(target=_do_restart, args=(False,), daemon=True).start()
+
+    def is_rebuild_enabled(item):
+        if getattr(jarvis_engine, '_build_phase', ''):
+            return False
+        return jarvis_engine._llm_free_event.is_set()
+
+    def on_rebuild_model(icon, item):
+        print("🔨 [Tray] Model Rebuild triggered...")
+        threading.Thread(
+            target=lambda: jarvis_engine.trigger_model_rebuild(mode="smart"),
+            daemon=True
+        ).start()
+
     # 2. Construct the Dynamic Menu
     menu = pystray.Menu(
-        pystray.MenuItem('JARVIS NEXUS', on_open_website, default=True),
+        pystray.MenuItem(f'JARVIS NEXUS v{_JARVIS_VERSION}', on_open_website, default=True),
 
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('⚙️ Open Settings', on_open_settings),
         pystray.MenuItem('🛠️ Env Setup Wizard', on_open_setup),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem('🔄 Restart', pystray.Menu(
+            pystray.MenuItem('⚡ Quick Restart (Keep Ollama)', on_quick_restart),
+            pystray.MenuItem('🔄 Full Restart (Kill Ollama)', on_full_restart),
+        )),
+        pystray.MenuItem('🔨 Rebuild LLM', on_rebuild_model, enabled=is_rebuild_enabled),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem('🛑 Immediate Exit', on_exit)
     )
 
     # 3. Run the icon with continuous state polling
-    icon = pystray.Icon("JARVIS", image, get_state_text(), menu)
+    icon = pystray.Icon(f"JARVIS v{_JARVIS_VERSION}", image, get_state_text(), menu)
     icon.run(setup=update_tooltip)
 
 def start_tray(jarvis_engine):

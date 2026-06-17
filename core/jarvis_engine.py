@@ -15,7 +15,7 @@ import random
 import threading
 import platform
 import requests
-import difflib 
+import difflib
 import hashlib
 import logging
 from pathlib import Path
@@ -344,7 +344,6 @@ class InternalCommandProcessor:
             else:
                 subprocess.Popen([sys.executable, "app.py", "--settings"])
         except Exception as e:
-            print(f"❌ [System] Error launching settings panel: {e}")
             logger.error(f"[System] Error launching settings panel: {e}")
             
         return "Opening settings panel."
@@ -367,10 +366,14 @@ class JARVISCore:
 
         # Component placeholders (filled during initialize())
         self.ears         = None
-        self.mouth        = None
-        self.memory       = None
-        self.browser      = None
-        self.llm_client   = None
+        self.mouth = None
+
+
+
+        # Build phase state for UI integration
+        self._build_phase = ""
+        
+        self.llm_client = None
 
         # Always-available subsystems
         self.video_player      = VideoPlayer()
@@ -404,14 +407,19 @@ class JARVISCore:
             logger.critical("[Bootstrap] Setup incomplete or wizard was closed without fixing. Terminating system.")
             import sys
             sys.exit(1)
+
+        _is_quick_restart = os.environ.get('JARVIS_QUICK_RESTART', '0') == '1'
+        if _is_quick_restart:
+            print("⚡ [Boot] Quick Restart mode — Skipping startup video & Ollama reboot.")
+            os.environ.pop('JARVIS_QUICK_RESTART', None)
             
         startup_show  = get_setting('startup_show', True)
         local_api_url = get_setting('local_api_url', 'http://localhost:11434')
 
         video_path     = STARTUP_VIDEO_PATH
-        video_duration = get_setting('startup_video_duration', 17.0)
+        video_duration = get_setting('startup_video_duration', 20.0)
 
-        if startup_show and os.path.exists(video_path):
+        if startup_show and not _is_quick_restart and os.path.exists(video_path):
             print(f"\n🎬 Booting Core Sequences (Parallel Mode)...")
             self.video_player.play_video(video_path, duration=video_duration, blocking=False)
 
@@ -428,7 +436,7 @@ class JARVISCore:
             ==============================================================================
             [ARCHITECTURAL NOTE: THE KV-CACHE PREFIX MATCHING EQUATION]
             If UI Video is enabled: We build the heavy Static Data (System Prompt + Tools) 
-            in this background thread while the video plays (takes ~15s masked by 17s video).
+            in this background thread while the video plays (takes ~15s masked by 20s video).
             
             Even if disabled, we force this warmup before saying "Systems Online".
             When the user speaks their FIRST_MESSAGE, we send Static + Flex Data.
@@ -439,10 +447,11 @@ class JARVISCore:
             """
             try:
                 print("🤖 Booting Local LLM Engine in background...")
-                # 1. Initialize the heavy LLM Client (Loads model into RAM)
+                self._build_phase = "building_model"
                 self.llm_client = LLMClient(base_url=local_api_url)
                 
                 print("⏳ Warming up LLM and building KV-Cache...")
+                self._build_phase = "warming_cache"
                 max_retries = get_setting('warmup_max_retries', 5)
                 
                 # 2. Build exact tools schema for perfect Hash Matching
@@ -500,6 +509,7 @@ class JARVISCore:
                 print(f"   [System] ❌ Fatal error in LLM Boot Thread: {e}")
                 logger.critical(f"[System] Fatal error in LLM Boot Thread: {e}")
             finally:
+                self._build_phase = ""
                 llm_ready_event.set()
 
         # 🚀 START THE HEAVY LIFTING IMMEDIATELY IN PARALLEL
@@ -531,9 +541,7 @@ class JARVISCore:
         # ---------------------------------------------------------
         # Sync Point: Wait for LLM Boot & Video to finish
         # ---------------------------------------------------------
-        if not llm_ready_event.wait(timeout=60):
-            print("⚠️ [System] LLM Boot Thread timed out. Proceeding with caution.")
-            logger.warning("[System] LLM Boot Thread timed out. Proceeding with caution.")
+        llm_ready_event.wait()
 
         # Ensure the video process finishes naturally before we declare "Systems Online"
         if startup_show and hasattr(self.video_player, 'current_process') and self.video_player.current_process:
@@ -653,7 +661,7 @@ class JARVISCore:
         finally:
             self._llm_busy = False
             self._llm_free_event.set()
-
+ 
     # =================================================================
     # Message Builder (KV-Cache Prefix Matching Optimized) #? (Hmody: look how beauty it looks)
     # =================================================================
@@ -785,7 +793,7 @@ class JARVISCore:
         messages.append({'role': 'user', 'content': final_user_content})
 
         return static_system_content, messages
-
+ 
     # ------------------------------------------------------------------
     # Process Command (Interrupt-Aware Agentic Loop)
     # ------------------------------------------------------------------
@@ -793,6 +801,9 @@ class JARVISCore:
         # Reset interrupt state at the start of every new command cycle
         self.state.reset_interrupt()
         
+        if self.llm_client is None:
+            return "Connection to mainframe lost. Operating on basic protocols."
+            
         is_internal, response = self.internal_commands.process(command)
         if is_internal:
             return response
@@ -1309,8 +1320,15 @@ class JARVISCore:
                                 if model:
                                     requests.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
                                     print(f"🧹 Unloaded model '{model}' from RAM.")
+                            
+                            import subprocess
+                            if platform.system() == "Windows":
+                                subprocess.run("taskkill /F /IM ollama.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                subprocess.run("taskkill /F /IM ollama_llama_server.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            else:
+                                subprocess.run(["pkill", "-9", "-f", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception as e:
-                            print(f"⚠️ Failed to unload Ollama models: {e}")
+                            print(f"⚠️ Failed to unload Ollama models or kill process: {e}")
                         self.running = False
                         break
 
@@ -1370,8 +1388,15 @@ class JARVISCore:
                             if model:
                                 requests.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
                                 print(f"🧹 Unloaded model '{model}' from RAM.")
+                    
+                    import subprocess
+                    if platform.system() == "Windows":
+                        subprocess.run("taskkill /F /IM ollama.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run("taskkill /F /IM ollama_llama_server.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(["pkill", "-9", "-f", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception as e:
-                    print(f"⚠️ Failed to unload Ollama models: {e}")
+                    print(f"⚠️ Failed to unload Ollama models or kill process: {e}")
                 self.running = False
                 break
             except Exception as e:
@@ -1382,3 +1407,12 @@ class JARVISCore:
         self.watch_dog.stop()
         print(f"\n✅ {self.assistant_name.upper()} shutdown complete.")
 
+    def trigger_model_rebuild(self, mode: str = "auto"):
+        """Called from tray or advanced settings to interactively rebuild the LLM model."""
+        if self.llm_client is None:
+            print("⚠️ [Rebuild] LLM client not initialized.")
+            return
+        print(f"🔨 [Rebuild] Starting {mode} model rebuild...")
+        self.llm_client.rebuild_model_interactive(mode=mode)
+
+#? (Hmody: hmmmm nah, im not gonaa split in now)
