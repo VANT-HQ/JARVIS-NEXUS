@@ -68,7 +68,7 @@ class LLMClient:
         self.base_url = base_url
         self.normal_model = None
         self.overthink_model = None
-        self.supports_native_tools = False
+        self.supports_native_tools = True
         self._initialize_client()
 
     # ------------------------------------------------------------------
@@ -100,6 +100,12 @@ class LLMClient:
         try:
             # Start Ollama serve in the background
             env = os.environ.copy()
+            
+            # --- Memory Optimization (Flash Attention & 8-bit KV Cache) ---
+            env['OLLAMA_FLASH_ATTENTION'] = '1'
+            env['OLLAMA_KV_CACHE_TYPE'] = 'q8_0'
+            # --------------------------------------------------------------
+            
             if platform.system() == "Windows":
                 subprocess.Popen(
                     ['ollama', 'serve'],
@@ -186,33 +192,6 @@ class LLMClient:
                 
             f.write(f"\n{'='*60}\n")
 
-    def _check_native_tool_support(self, model_name: str):
-        """
-        Dynamically checks if the model officially supports native tools
-        by inspecting its template via the Ollama API.
-        If native tools are NOT detected, the model will still run but
-        tool calls will not be sent — tools are native-only in this system.
-        """
-        print(f"🔍 Analyzing tool support for '{model_name}'...")
-        try:
-            response = requests.post(f"{self.base_url}/api/show", json={"model": model_name}, timeout=5)
-            if response.ok:
-                template = response.json().get("template", "")
-                if "{{ .Tools }}" in template or "{{- if .Tools }}" in template or "tool_calls" in template.lower():
-                    self.supports_native_tools = True
-                    print(f"✅ LLM supports NATIVE JSON tool calling.")
-                else:
-                    self.supports_native_tools = False
-                    print(f"⚠️ Model template has no native tool support. Tools will NOT be sent.")
-                    logger.warning("Model template has no native tool support. Tools will NOT be sent.")
-            else:
-                print(f"⚠️ Native Tools Support: UNKNOWN (Failed to fetch model info). Assuming no native tools.")
-                logger.warning("Native Tools Support: UNKNOWN (Failed to fetch model info). Assuming no native tools.")
-                self.supports_native_tools = False
-        except Exception as e:
-            print(f"⚠️ Native Tools Support: ERROR ({e}). Assuming no native tools.")
-            logger.error(f"Native Tools Support: ERROR ({e}). Assuming no native tools.")
-            self.supports_native_tools = False
 
     # =================================================================
     # Quality Parsing Method
@@ -451,9 +430,6 @@ class LLMClient:
                         if modelfile_path.exists():
                             modelfile_path.unlink()
 
-            # 8. PERFORM RUNTIME CHECK FOR TOOL SUPPORT
-            if self.normal_model:
-                self._check_native_tool_support(self.normal_model)
 
         except Exception as e:
             print(f"❌ Ollama model management error: {e}")
@@ -550,12 +526,45 @@ class LLMClient:
             # Always strip the JSON blob from spoken text
             clean_text = clean_text[:_im.start()] + clean_text[_im.end():]
 
+                # --- Format 3: <result>tool_name.md {"args": ...}</result> (misplaced tool call) ---
+        _result_tool_pattern = r'<result>\s*([a-z_]+)\.md\s*(\{[^}]*\})\s*</result>'
+        _result_matches = list(re.finditer(_result_tool_pattern, text, flags=re.IGNORECASE))
+        for _rm in reversed(_result_matches):
+            _tool_name = _rm.group(1).strip()
+            _args_str = _rm.group(2).strip()
+            try:
+                _args_parsed = json.loads(_args_str)
+                if isinstance(_args_parsed, dict):
+                    tools.append({"name": _tool_name, "arguments": _args_parsed})
+            except (json.JSONDecodeError, TypeError):
+                pass
+            clean_text = clean_text[:_rm.start()] + clean_text[_rm.end():]
+
+        # --- Format 4: Native XML tags <tool_name arg="value"/> ---
+        # e.g., <manage_tasks action="create" time_expression="in 45 minutes" title="Check the oven"/>
+        xml_tag_pattern = r'<([a-z_]+)\s+([^>]*?)/?>'
+        xml_tag_matches = list(re.finditer(xml_tag_pattern, clean_text, flags=re.IGNORECASE))
+        for _m in reversed(xml_tag_matches):
+            tool_name = _m.group(1).strip()
+            # Ignore standard xml tags that might appear (like verbal, result, reasoning)
+            if tool_name.lower() in ["verbal", "result", "reasoning", "tool_call"]:
+                continue
+                
+            attr_str = _m.group(2).strip()
+            args = {}
+            for attr_match in re.finditer(r'([a-z_]+)="([^"]*)"', attr_str, flags=re.IGNORECASE):
+                args[attr_match.group(1)] = attr_match.group(2)
+            
+            if args or attr_str == "": # Even if no args, it might be a tool like <deactivate_core/>
+                tools.append({"name": tool_name, "arguments": args})
+                clean_text = clean_text[:_m.start()] + clean_text[_m.end():]
+
         return tools, clean_text.strip()
 
     # ------------------------------------------------------------------
     # Public Generation Pipeline
     # ------------------------------------------------------------------
-    def generate_response(self, messages: List[Dict], system_prompt: str = None, is_overthinking: bool = False, tools: List[Dict] = None, temperature: float = 0.1, line_callback=None, abort_event=None, on_tool_start_callback=None, ttft_anchor: float = None) -> Dict:
+    def generate_response(self, messages: List[Dict], system_prompt: str = None, is_overthinking: bool = False, tools: List[Dict] = None, temperature: float = 0.1, line_callback=None, abort_event=None, on_tool_start_callback=None, ttft_anchor: float = None, result_chunk_callback=None) -> Dict:
         """Executes LLM generation natively. Strict JSON mapping."""
         try:
             target_model = self.overthink_model if is_overthinking else self.normal_model
@@ -568,7 +577,8 @@ class LLMClient:
                 system_prompt,    
                 abort_event=abort_event,
                 on_tool_start_callback=on_tool_start_callback,
-                ttft_anchor=ttft_anchor
+                ttft_anchor=ttft_anchor,
+                result_chunk_callback=result_chunk_callback
             )
             
             if not raw_response['success']: return raw_response
@@ -591,10 +601,10 @@ class LLMClient:
                     except json.JSONDecodeError:
                         args = {}
                     if name: unified_tools.append({'name': name, 'arguments': args})
-            else:
-                # Recovery: some small models emit tool calls as text
-                recovered_tools, clean_text = self._parse_native_text_tool_call(clean_text)
-                unified_tools.extend(recovered_tools)
+            
+            # Recovery: some small models emit tool calls as text (ALWAYS run)
+            recovered_tools, clean_text = self._parse_native_text_tool_call(clean_text)
+            unified_tools.extend(recovered_tools)
 
             # Cleanup: strip <verbal> tags from final spoken text
             clean_text = re.sub(r'(?i)</?verbal>', '', clean_text).strip()
@@ -619,13 +629,13 @@ class LLMClient:
             return {'success': False, 'error': str(e)}
             
             
-    def _local_generate(self, messages, target_model, temperature, timeout_val, line_callback, tools, is_overthinking: bool = False, system_prompt: str = None, abort_event=None, on_tool_start_callback=None, ttft_anchor: float = None) -> Dict:
+    def _local_generate(self, messages, target_model, temperature, timeout_val, line_callback, tools, is_overthinking: bool = False, system_prompt: str = None, abort_event=None, on_tool_start_callback=None, ttft_anchor: float = None, result_chunk_callback=None) -> Dict:
         endpoint = f"{self.base_url}/api/chat"
         is_high_perf = get_setting("high_performance", False)
-        safe_keep_alive = get_setting('llm_keep_alive_high_perf', '15m') if is_high_perf else get_setting('llm_keep_alive_normal', '10m')
+        safe_keep_alive = f"{get_setting('llm_keep_alive_high_perf', 15)}m" if is_high_perf else f"{get_setting('llm_keep_alive_normal', 10)}m"
         
         max_tokens = get_setting('llm_max_tokens_overthink', 2048) if is_overthinking else get_setting('llm_max_tokens_normal', 1024)
-        context_window = get_setting('llm_context_window', 4096)
+        context_window = get_setting('llm_context_window', 6144)
 
         payload = {
             "model": target_model,
@@ -662,6 +672,8 @@ class LLMClient:
             full_content = ""
             current_chunk = ""
             native_tools = []
+            
+            in_result_block = False
 
             for line in response.iter_lines():
                 if abort_event and abort_event.is_set():
@@ -688,11 +700,37 @@ class LLMClient:
 
                         full_content += char
                         current_chunk += char
+                        
+                        if result_chunk_callback:
+                            lower_content = full_content.lower()
+                            start_idx = lower_content.rfind("<result>")
+                            end_idx = lower_content.rfind("</result>")
+                            
+                            if start_idx != -1 and start_idx > end_idx:
+                                if not in_result_block:
+                                    content_so_far = full_content[start_idx + 8:]
+                                    if content_so_far.strip():  # Only trigger if there is actual non-whitespace content
+                                        in_result_block = True
+                                        result_chunk_callback(content_so_far)
+                                elif char.strip():
+                                    result_chunk_callback(char)
+                            elif in_result_block and end_idx != -1 and end_idx > start_idx:
+                                in_result_block = False
 
-                        # Sentence boundary detection (stops at punctuation followed by space or tag endings)
-                        is_tool_call = bool(re.search(r'(?i)<reasoning>|<tool_call>', current_chunk))
+                        # MODIFIED: Buffer Poisoning Fix — actively clean completed silent blocks from the buffer
+                        # instead of using a permanent flag that blocks TTS for the rest of the stream
+                        current_chunk = re.sub(r'(?si)<reasoning>.*?</reasoning>', '', current_chunk)
+                        current_chunk = re.sub(r'(?si)<tool_call>.*?</tool_call>', '', current_chunk)
+                        current_chunk = re.sub(r'(?si)<result>.*?</result>', '', current_chunk)
 
-                        if not is_tool_call and len(current_chunk.strip()) > 1:
+                        # Check if we are CURRENTLY inside an open, unclosed silent tag
+                        is_inside_silent_tag = bool(re.search(
+                            r'(?i)<(?:reasoning|tool_call|result)[^>]*>(?!.*</(?:reasoning|tool_call|result)>)',
+                            current_chunk, re.DOTALL
+                        ))
+
+                        # Sentence boundary detection — only fire TTS if NOT inside a silent block
+                        if not is_inside_silent_tag and not in_result_block and len(current_chunk.strip()) > 1:
                             match = re.search(r'([.!?])\s+', current_chunk)
                             has_newline = '\n' in current_chunk
                             has_verbal = '</verbal>' in current_chunk.lower()
@@ -707,6 +745,8 @@ class LLMClient:
                                     current_chunk = ""
                                 
                                 clean_spoken_chunk = re.sub(r'(?i)</?verbal>', '', to_speak).strip()
+                                # Strip any partial opening tag residue at the end
+                                clean_spoken_chunk = re.sub(r'(?i)<[a-z_]*$', '', clean_spoken_chunk).strip()
                                 if clean_spoken_chunk and line_callback:
                                     line_callback(clean_spoken_chunk)
 
@@ -730,7 +770,10 @@ class LLMClient:
                                     native_tools.append(tc)
 
             if current_chunk.strip() and line_callback:
-                line_callback(current_chunk.strip())
+                if not bool(re.search(r'(?i)<reasoning>|<tool_call>|<result>', current_chunk)):
+                    clean_final = re.sub(r'(?i)</?verbal>', '', current_chunk).strip()
+                    if clean_final:
+                        line_callback(clean_final)
 
             self._log_raw_io(session_id, "FINAL RAW OUTPUT FROM MODEL", full_content)
 

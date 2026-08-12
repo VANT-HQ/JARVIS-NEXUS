@@ -80,13 +80,17 @@ class BrowsingTool:
             return ""
         return re.sub(r'\s+', ' ', text).strip()
 
-    def _clean_and_format_for_llm(self, html_text: str, url: str) -> str:
+    def _clean_and_format_for_llm(self, html_text: str, url: str, max_len: int = None) -> str:
         """
         Strips unnecessary layout structures (scripts, CSS style definitions, nav elements) 
         and crops raw markdown/text to safely fit within the target model's limits.
+        MODIFIED: Added max_len parameter for dynamic per-result token budget control.
         """
         if not html_text:
             return ""
+        
+        # MODIFIED: Use dynamic max_len if provided, otherwise fall back to global constant
+        effective_limit = max_len if max_len is not None else MAX_LLM_TEXT_LENGTH
             
         try:
             # If content comes pre-parsed from Jina AI Reader, it is markdown; skip HTML text parser
@@ -114,9 +118,9 @@ class BrowsingTool:
             # Standardize structural alignment
             compact_text = self._collapse_whitespace(cleaned_text)
             
-            # Apply strict context limits
-            if len(compact_text) > MAX_LLM_TEXT_LENGTH:
-                compact_text = compact_text[:MAX_LLM_TEXT_LENGTH] + "\n...[Content Truncated]..."
+            # Apply strict context limits using dynamic budget
+            if len(compact_text) > effective_limit:
+                compact_text = compact_text[:effective_limit] + "\n...[Content Truncated]..."
                 
             return f"Source: {url}\n{compact_text}"
             
@@ -194,6 +198,10 @@ class BrowsingTool:
             else:
                  print(f"💡 Discovered {len(search_results)} URLs. Extracting contents...")
 
+            # MODIFIED: Dynamic per-result token budget to prevent context window overflow.
+            # 5 results × 3000 chars = 15000 chars (~90% of context). Cap total at ~2400 chars.
+            safe_per_url_budget = max(500, int(2400 / max(1, len(search_results))))
+
             for result in search_results:
                 try:
                     title = result.get('title', '')
@@ -211,7 +219,8 @@ class BrowsingTool:
                     
                     if extract_text:
                         html_text = self._smart_fetch(link)
-                        clean_text = self._clean_and_format_for_llm(html_text, link)
+                        # MODIFIED: Pass dynamic budget instead of global hard-coded limit
+                        clean_text = self._clean_and_format_for_llm(html_text, link, max_len=safe_per_url_budget)
                         result_data['full_text'] = clean_text
                     
                     results.append(result_data)

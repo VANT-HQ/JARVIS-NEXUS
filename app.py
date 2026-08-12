@@ -13,9 +13,9 @@
 #* im exited to see ur collaboration on the repo ^_^
 
 #? SOCIAL MEDIA -> @Hmody Code  
-
-#! Total time spented on THIS version: 6 months. 
-
+ 
+#! Total time spented on THIS version: 6 months. (v1.0, not including sub-versions)
+#! Typed on 16 Jun 2026
 
 
 """
@@ -36,7 +36,7 @@ All logic lives in core/jarvis_engine.py and core/llm_client.py.
 To run: python app.py
 
 Author: Hmody -> Lead Architect @ V.A.N.T.
-Version: 1.1 (Stable Release)
+Version: 1.3 (Stable Release)
 """
 
 # ─── DLL HELL PREVENTION (MUST BE THE ABSOLUTE FIRST LINE) ───
@@ -61,6 +61,25 @@ elif "__compiled__" in globals():
 else:
     PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ─── EARLY EXIT: --template must be handled BEFORE heavy imports ────────────
+# Loading core.logger/core.config triggers DB init, audio drivers, etc. — a
+# 4-7s penalty just to show a small dialog window. Handle it here instead.
+if "--template" in sys.argv:
+    # MODIFIED: Fast path — import ONLY the builder, skip all heavy dependencies
+    from core.bootstrap.template_builder import request_template_from_user
+    _idx = sys.argv.index("--template")
+    _model = sys.argv[_idx+1] if len(sys.argv) > _idx+1 else "unknown"
+    _has_auto_str = sys.argv[_idx+2] if len(sys.argv) > _idx+2 else "False"
+    _res = request_template_from_user(_model, has_auto=(_has_auto_str.lower() == 'true'))
+    if _res == "__AUTO__":
+        print("__TEMPLATE_START__\n__AUTO__\n__TEMPLATE_END__")
+    elif _res:
+        print(f"__TEMPLATE_START__\n{_res}\n__TEMPLATE_END__")
+    else:
+        print("__TEMPLATE_ABORT__")
+    sys.exit(0)
+# ─── END EARLY EXIT ──────────────────────────────────────────────────────────
 
 # ─── Initialize System Logger ──────────────────────────────────────────────
 from core.logger import setup_logger
@@ -93,8 +112,8 @@ def main():
     # ───────────────────────────────────────────────────────────────────────────
     
     # ─── Single import from the engine ─────────────────────────────────────────
-    from core.jarvis_engine import JARVISCore  #! Full Program
-    # from core.skip_stt import SkipSTTCore as JARVISCore  #! TESTING: Terminal mode (no audio)
+    # from core.jarvis_engine import JARVISCore  #! Full Program
+    from core.skip_stt import SkipSTTCore as JARVISCore  #! TESTING: Terminal mode (no audio)
     
     jarvis = None
     try:
@@ -124,19 +143,19 @@ def main():
         print(f"\n📄 Crash report saved to {crash_log_path}")
         
         # Pause before closing the console so the user can see the error
-        if getattr(sys, 'frozen', False):
+        if getattr(sys, 'frozen', False) and not isinstance(e, SystemExit):
             input("\nPress Enter to exit...")
     finally:
         logger.info("JARVIS application terminated.")
-        # Ensure terminal stays open in EXE mode
-        if getattr(sys, 'frozen', False):
-            input("\nPress Enter to exit...")
+        # Ensure terminal stays open in EXE mode ONLY if not a clean exit
+        if getattr(sys, 'frozen', False) and 'e' in locals() and not isinstance(e, SystemExit):
+            pass
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     
     # ─── Single Instance Enforcement (Main App) ───
-    if "--settings" not in sys.argv and "--setup" not in sys.argv and "--template" not in sys.argv:
+    if "--settings" not in sys.argv and "--setup" not in sys.argv and "--template" not in sys.argv and "--results" not in sys.argv and "--results-live" not in sys.argv:
         from core.bootstrap.utils import enforce_single_instance
         if not enforce_single_instance("JARVIS_Main_App_Mutex"):
             print("\n❌ JARVIS is already running! Only one core instance is allowed.")
@@ -160,10 +179,18 @@ if __name__ == "__main__":
     if "--settings" in sys.argv:
         from core.ui.settings_panel import launch
         launch()
+    elif "--results" in sys.argv:
+        from core.ui.results_viewer import open_viewer
+        open_viewer(live=False)
+    elif "--results-live" in sys.argv:
+        from core.ui.results_viewer import open_viewer
+        open_viewer(live=True)
     elif "--setup" in sys.argv:
         from core.bootstrap.env_setup import launch_wizard
         launch_wizard()
     elif "--template" in sys.argv:
+        # NOTE: This branch is now only reached in edge cases (e.g. if early-exit above was bypassed).
+        # The primary handler is the early-exit block at the top of the file.
         from core.bootstrap.template_builder import request_template_from_user
         idx = sys.argv.index("--template")
         model = sys.argv[idx+1] if len(sys.argv) > idx+1 else "unknown"

@@ -15,7 +15,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict, List
 import core.tools.os_actions as os_actions
-from core.config import ENV_PROMPT
+
 
 
 # ------------------------------------------------------------------
@@ -40,7 +40,7 @@ def _format_web_search(browser, query: str, max_results: int) -> str:
 
 def _format_os_action(action_func, args: dict, os_type: str) -> str:
     """Helper to inject OS context and format OS action returns."""
-    args["os_type"] = os_type
+    args = {**args, "os_type": os_type}  # MODIFIED: copy instead of mutate — prevents _done_names signature mismatch
     success, msg, data = action_func(args)
     if data:
         return f"{msg}\n\n[DATA]\n{data}"
@@ -86,22 +86,20 @@ def _extract_friendly_path(raw_arg: str, is_dir: bool = False) -> str:
 # ANY member auto-escalates to the entire group.
 
 PERMISSION_GROUPS = {
-    'file_access':      ['edit_file', 'manage_workspace'],
-    'process_control':  ['kill_process', 'deactivate_core'],
+    'file_access':      ['mutate_filesystem'],
+    'process_control':  ['manage_desktop_apps', 'deactivate_core'],
     'system_power':     ['system_power']
 }
 
 SILENT_TOOLS = [
-    'open_website', 'open_application', 
-    'open_google_search', 'youtube_action',
-    'set_volume', 'set_brightness', 'close_window',
-    'take_screenshot',
+    'youtube_action',
+    'adjust_hardware', 'open_browser_visuals', 'manage_desktop_apps'
 ]
 
 # Read-only tools that do not consume iterations when executed alone
 FREE_TOOLS = {
     'list_directory', 'read_file', 'search_memory',
-    'search_web', 'system_status', 'get_nexus_info',
+    'search_web', 'system_status',
 }
 
 # Reverse lookup: tool_name -> group_name
@@ -110,16 +108,25 @@ for _group, _members in PERMISSION_GROUPS.items():
     for _tool in _members:
         _TOOL_TO_GROUP[_tool] = _group
 
-def _is_allowed(state, tool_name: str) -> bool:
+def _is_allowed(state, tool_name: str, args: dict = None) -> bool:
     """
     Smart permission check driven strictly by PERMISSION_GROUPS.
     1. If root_mode is active -> Allowed.
     2. If the tool is NOT in PERMISSION_GROUPS -> Allowed automatically (No prompt).
     3. If protected -> checks if user granted explicit permission.
     """
+    if args is None:
+        args = {}
+
     if state.root_mode:
         return True
         
+    # Dynamic Action Check for consolidated tools
+    if tool_name == 'manage_desktop_apps' and args.get('action') != 'kill':
+        return True
+        
+
+
     # Dynamic Check: If not protected by our list, execute freely
     if tool_name not in _TOOL_TO_GROUP and tool_name not in PERMISSION_GROUPS:
         return True
@@ -213,22 +220,31 @@ def register_all_tools(jarvis_instance):
             if not title:
                 return "Failed: Title is required."
             
-            # NEW: Extract model variables safely
-            time_type = args.get("time_type", "none")
-            delay_minutes = args.get("delay_minutes", 0)
-            delay_hours = args.get("delay_hours", 0)
-            delay_days = args.get("delay_days", 0)
-            absolute_date = args.get("absolute_date")
-            absolute_time = args.get("absolute_time")
+            time_expression = args.get("time_expression", "")
             priority = args.get("priority", 2)
+            
+            absolute_date = None
+            absolute_time = None
+            time_type = "none"
+            
+            if time_expression:
+                try:
+                    import dateparser
+                    parsed_date = dateparser.parse(time_expression, settings={'PREFER_DATES_FROM': 'future'})
+                    if parsed_date:
+                        absolute_date = parsed_date.strftime("%Y-%m-%d")
+                        absolute_time = parsed_date.strftime("%H:%M")
+                        time_type = "absolute"
+                except Exception as e:
+                    print(f"Failed to parse time expression '{time_expression}': {e}")
 
             task_id = memory_mgr.create_task(
                 title=title,
                 priority=priority,
                 time_type=time_type,
-                delay_minutes=delay_minutes,
-                delay_hours=delay_hours,
-                delay_days=delay_days,
+                delay_minutes=0,
+                delay_hours=0,
+                delay_days=0,
                 absolute_date=absolute_date,
                 absolute_time=absolute_time
             )
@@ -242,12 +258,22 @@ def register_all_tools(jarvis_instance):
             task_id = args.get('task_id')
             if not task_id:
                 return "Failed: task_id is required."
-            return "Success" if memory_mgr.modify_task(
-                int(task_id),
-                new_status="completed" if action == "complete" else "stopped"
-            ) else "Failed."
 
-        return "Invalid action."
+            task_id_int = int(task_id)
+            success = memory_mgr.modify_task(
+                task_id_int,
+                new_status="completed" if action == "complete" else "stopped"
+            )
+
+            if success:
+                # Evict WatchDog cache immediately so it stops tracking this task
+                # without waiting for the next sync_upcoming_tasks() cycle.
+                watch_dog = getattr(jarvis_instance, 'watch_dog', None)
+                if watch_dog and hasattr(watch_dog, 'evict_task_cache'):
+                    watch_dog.evict_task_cache(task_id_int)
+                return "Success"
+            return "Failed."
+
 
     # ==========================================
     # --- 1. Memory Tools ---
@@ -257,15 +283,17 @@ def register_all_tools(jarvis_instance):
         aliases=["recall", "find_memory", "get_memory"],
         summary="Search long-term database for facts and past events.",
         announcement="Checking my memory...", 
+        is_free=True,
+        is_silent=True,
         func=lambda args: _format_memory_search(jarvis_instance.memory, args.get('query', '')),
         schema={
             "type": "function",
             "function": {
                 "name": "search_memory",
-                "description": "Search the user's PERSONAL database. Use ONLY for questions about the user themselves (their preferences, their setup, their architecture, their projects). CRITICAL RULE: If the prompt asks 'what is my [X]' or mentions personal environment, YOU MUST CALL THIS TOOL instead of saying you don't have access. DO NOT guess.",
+                "description": "CRITICAL: ALWAYS use this tool BEFORE saying 'I don't know' or asking the user to remind you about personal facts, names, or preferences. Searches your internal database for the user's personal facts, preferences, and past events. NEVER ask the user for information before searching first.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"query": {"type": "string", "description": "The exact keyword or question."}},
+                    "properties": {"query": {"type": "string", "description": "The specific topic or question (e.g., 'coffee', 'favorite color')."}},
                     "required": ["query"]
                 }
             }
@@ -277,12 +305,13 @@ def register_all_tools(jarvis_instance):
         aliases=["remember", "store_knowledge", "note_down", "add_fact"],
         summary="Save an event, thought, preference, or factual knowledge.",
         announcement="Saving that to memory...", 
+        is_silent=True,
         func=lambda args: f"Memory stored successfully. ID: {jarvis_instance.memory.save_to_memory(content=args.get('content', ''), category=args.get('category', 'event'))}",
         schema={
             "type": "function",
             "function": {
                 "name": "save_to_memory",
-                "description": "USE ONLY FOR: Storing personal facts, preferences, or general events/notes. DO NOT USE for TODOs or tasks. If the user mentions a 'task', 'todo', 'remind me', or 'after X minutes', you MUST use 'manage_tasks'.",
+                "description": "CRITICAL: Saves the user's personal facts, preferences, and events to your internal database. You MUST call this tool whenever the user shares information about themselves. DO NOT just acknowledge it verbally.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -306,6 +335,8 @@ def register_all_tools(jarvis_instance):
         aliases=["google", "browse", "search", "search_site"],
         summary="Search the web for real-time information.",
         announcement="Searching the web...", 
+        is_free=True,
+        is_silent=True,
         func=lambda args: _format_web_search(
             jarvis_instance.browser, 
             args.get('query', ''), 
@@ -315,7 +346,7 @@ def register_all_tools(jarvis_instance):
             "type": "function",
             "function": {
                 "name": "search_web",
-                "description": "Search the web for information when you need real-time data. Use this to fetch RAW DATA. If the user wants to SEE visual results, use 'open_google_search' instead.",
+                "description": "CRITICAL: You MUST call this tool whenever the user asks for real-time information, weather, news, current stock prices, or events. Example: weather in Tokyo -> call search_web. DO NOT say you lack access.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -329,41 +360,23 @@ def register_all_tools(jarvis_instance):
     )
  
     registry.register(
-        name="open_google_search",
-        summary="Optimizes a search query and opens it visually in the browser.",
-        announcement="Showing you the visual results...", 
-        func=lambda args: _format_os_action(os_actions.google_search, args, state.os_type),
+        name="open_browser_visuals",
+        aliases=["open_website", "google_search", "open_google_search", "visit_site"],
+        summary="Opens a website or performs a Google image search.",
+        announcement="Opening the browser...",
+        func=lambda args: _format_os_action(os_actions.open_browser_visuals, args, state.os_type),
         schema={
             "type": "function",
             "function": {
-                "name": "open_google_search",
-                "description": "Opens the user's web browser to visually show Google search results. Use this IMMEDIATELY when the user asks to SEE pictures, photos, designs, products, maps, or any visual content. CRITICAL: DO NOT say you cannot show images. ALWAYS act as a 'Query Optimizer' by translating their request into a refined, professional SEO search query. This is your primary way to 'show' things.",
+                "name": "open_browser_visuals",
+                "description": "Opens a specific URL/platform or performs a Google image search for visual results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The highly optimized and refined search query."}
+                        "action": {"type": "string", "enum": ["google_image_search", "visit_url"]},
+                        "target": {"type": "string", "description": "The search query (for google_image_search) or site name/URL (for visit_url)."}
                     },
-                    "required": ["query"]
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="open_website",
-        aliases=["visit_site", "open_web", "op_site"],
-        summary="Open a website via browser.",
-        announcement="Opening that now...", 
-        func=lambda args: _format_os_action(os_actions.open_website, args, state.os_type),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "open_website",
-                "description": "Opens a specific URL or platform (e.g., 'GitHub', 'LinkedIn'). If you don't have the exact URL, provide the name; the OS-Layer will attempt to find the best match. DO NOT say you don't have the link.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"site_name": {"type": "string", "description": "Name of the site or full URL."}},
-                    "required": ["site_name"]
+                    "required": ["action", "target"]
                 }
             }
         }
@@ -379,7 +392,7 @@ def register_all_tools(jarvis_instance):
             "type": "function",
             "function": {
                 "name": "youtube_action",
-                "description": "SPECIFIC TO YOUTUBE. Use this to either play a specific video directly on YouTube, or just search and show results. Never call 'open_website' for YouTube tasks.",
+                "description": "CRITICAL: You MUST call this tool whenever the user asks to play music, play a video, play something, or search YouTube. Example: 'play some synthwave music' or 'play a song' -> call youtube_action. DO NOT just respond verbally without calling this tool.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -397,11 +410,12 @@ def register_all_tools(jarvis_instance):
         name="deep_research",
         summary="Perform complex web research and autonomously extract/save facts.",
         announcement="Starting deep research...", 
+        is_silent=True,
         func=lambda args: (
             json.dumps(jarvis_instance.browser.deep_research(
                 topic=args.get('topic', 'General'), 
                 max_sources=args.get('max_sources', 3), 
-                save_to_memory=True
+                save_to_memory=True                                 #? (Hmody: it save every thing for now, will get full support soon)
             ))
             if hasattr(jarvis_instance.browser, 'deep_research')
             else "Deep research module offline."
@@ -435,31 +449,19 @@ def register_all_tools(jarvis_instance):
             "type": "function",
             "function": {
                 "name": "manage_tasks",
-                "description": "Create or manage tasks and reminders.",
+                "description": "CRITICAL: You MUST call this tool whenever the user says remind me, set a reminder, set a timer, or create a todo. For completing/deleting, you MUST provide the correct 'task_id' (look for [ID: X] in the TIME-AWARE TASK CONTEXT). DO NOT guess the ID.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "complete", "delete"]},
                         "title": {"type": "string"},
-                        "task_id": {"type": "integer"},
-                        "time_type": {
-                            "type": "string",
-                            "enum": ["relative", "absolute", "none"],
-                            "description": "CRITICAL: Is the user time 'relative' (e.g., after 10 mins, tomorrow) or 'absolute' (e.g., on the 13th, at 5 PM)?"
-                        },
-                        "delay_minutes": {"type": "integer", "description": "Use for 'after X minutes' or 'half an hour' (30)"},
-                        "delay_hours": {"type": "integer", "description": "Use for 'after X hours'"},
-                        "delay_days": {"type": "integer", "description": "Use for 'tomorrow' (1) or 'after X days'"},
-                        "absolute_date": {
+                        "task_id": {"type": "integer", "description": "The EXACT task ID from the [ID: X] block in your system context. REQUIRED for complete/delete actions."},
+                        "time_expression": {
                             "type": "string", 
-                            "description": "Use for exact dates (e.g. 'on the 13th'). Format: YYYY-MM-DD. Use the [sys: time=...] to know the current year and month."
-                        },
-                        "absolute_time": {
-                            "type": "string", 
-                            "description": "Use for exact clock time (e.g. 'at 5 PM'). Format: HH:MM (24-hour)."
+                            "description": "The exact time the user requested (e.g., 'tomorrow at 5pm', 'in 30 minutes', 'next monday'). Leave empty if none."
                         }
                     },
-                    "required": ["action", "time_type"]
+                    "required": ["action"]
                 }
             }
         }
@@ -473,6 +475,7 @@ def register_all_tools(jarvis_instance):
         aliases=["ls", "dir", "show_files"],
         summary="Lists all files and folders in a specific directory.",
         announcement="Listing the directory...", 
+        is_free=True,
         func=lambda args: _with_path_tracking(
             _format_os_action(os_actions.list_directory, {**args, "override_permission": _is_allowed(state, 'list_directory')}, state.os_type),
             args.get('dir_path', ''),
@@ -499,6 +502,7 @@ def register_all_tools(jarvis_instance):
         aliases=["read", "cat"],
         summary="Reads the content of a text-based file.",
         announcement="Reading the file...", 
+        is_free=True,
         func=lambda args: _with_path_tracking(
             _format_os_action(os_actions.read_file, {
                 **{k: v for k, v in args.items() if k != 'override_permission'}, 
@@ -526,103 +530,34 @@ def register_all_tools(jarvis_instance):
     )
 
     registry.register(
-        name="write_file",
-        aliases=["save_file", "create_file"],
-        summary="Creates or overwrites a text file.",
-        announcement="Writing the file...", 
+        name="mutate_filesystem",
+        aliases=["write_file", "edit_file", "manage_workspace", "mkdir", "delete", "move"],
+        summary="Creates, edits, moves, or deletes files and directories.",
+        announcement="Modifying the filesystem...",
         func=lambda args: _with_path_tracking(
-            _format_os_action(os_actions.write_file, {
-                **{k: v for k, v in args.items() if k != 'override_permission'}, 
-                "override_permission": _is_allowed(state, 'write_file')
+            _format_os_action(os_actions.mutate_filesystem, {
+                **{k: v for k, v in args.items() if k != 'override_permission'},
+                "override_permission": _is_allowed(state, 'mutate_filesystem', args)
             }, state.os_type),
-            args.get('file_path', ''),
-            False
+            args.get('path', ''),
+            args.get('action') == 'mkdir'
         ),
         schema={
             "type": "function",
             "function": {
-                "name": "write_file",
-                "description": "ONLY tool for creating NEW text/code files. Use this when user says 'create a file', 'make a file', 'write to file'. NEVER use manage_workspace to create files — that's for FOLDERS only.",
+                "name": "mutate_filesystem",
+                "description": "Modifies the filesystem. Actions: create_file, edit_string, mkdir, move, delete.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "file_path":           {"type": "string"},
-                        "content":             {"type": "string"}
+                        "action": {"type": "string", "enum": ["create_file", "edit_string", "mkdir", "move", "delete"]},
+                        "path": {"type": "string", "description": "Target file or directory path."},
+                        "content": {"type": "string", "description": "Used only for create_file."},
+                        "old_string": {"type": "string", "description": "Used only for edit_string."},
+                        "new_string": {"type": "string", "description": "Used only for edit_string."},
+                        "destination_path": {"type": "string", "description": "Used only for move."}
                     },
-                    "required": ["file_path", "content"]
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="edit_file",
-        aliases=["modify_file", "change_file", "modify_line"],
-        summary="Edits a specific string within a file safely.",
-        announcement="Editing the file...", 
-        func=lambda args: _with_path_tracking(
-            _format_os_action(os_actions.edit_file, {
-                **{k: v for k, v in args.items() if k != 'override_permission'}, 
-                "override_permission": _is_allowed(state, 'edit_file')
-            }, state.os_type),
-            args.get('file_path', ''),
-            False
-        ),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "edit_file",
-                "description": "Replaces a specific string inside a file. This tool is SMART and space-resilient; it handles indentation and multiple spaces automatically.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_path":           {"type": "string"},
-                        "old_string":          {"type": "string"},
-                        "new_string":          {"type": "string"},
-                        "replace_all":         {"type": "boolean", "default": False}
-                    },
-                    "required": ["file_path", "old_string", "new_string"]
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="manage_workspace",
-        aliases=["mkdir", "move_file", "rename_file", "delete_file", "rm"],
-        summary="Creates, moves, or deletes files and directories.",
-        announcement="Managing workspace...", 
-        func=lambda args: _with_path_tracking(
-            _format_os_action(os_actions.manage_workspace, {
-                **{k: v for k, v in args.items() if k != 'override_permission'}, 
-                "override_permission": _is_allowed(state, 'manage_workspace')
-            }, state.os_type),
-            args.get('target_path', ''),
-            args.get('action') == 'mkdir'  # Track as dir if making a dir
-        ),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "manage_workspace",
-                "description": "Structural operations ONLY: Create FOLDERS (mkdir), Move/Rename items, or Delete items. NEVER use for creating files — use write_file instead.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string", 
-                            "enum": ["mkdir", "move", "delete"],
-                            "description": "The operation to perform."
-                        },
-                        "target_path": {
-                            "type": "string", 
-                            "description": "The path to the file/folder you want to act on."
-                        },
-                        "destination_path": {
-                            "type": "string", 
-                            "description": "REQUIRED ONLY if action is 'move'. The new path or new name."
-                        }
-                    },
-                    "required": ["action", "target_path"]
+                    "required": ["action", "path"]
                 }
             }
         }
@@ -654,88 +589,26 @@ def register_all_tools(jarvis_instance):
     )
 
     registry.register(
-        name="open_application",
-        aliases=["launch", "open_app"],
-        summary="Opens a local application.",
-        announcement="Launching the application...", 
-        func=lambda args: _format_os_action(os_actions.open_application, args, state.os_type),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "open_application",
-                "description": "Opens installed desktop software/applications (e.g., Chrome, Spotify, Word). DO NOT use this tool if the user asks to run a 'scenario', 'script', or 'routine'.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"app_name": {"type": "string"}},
-                    "required": ["app_name"]
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="kill_process",
-        aliases=["close_app", "kill", "force_close"],
-        summary="Forcefully closes a running application.",
-        announcement="Terminating the process...", 
-        func=lambda args: _format_os_action(os_actions.kill_process, {
-            **{k: v for k, v in args.items() if k != 'override_permission'}, 
-            "override_permission": _is_allowed(state, 'kill_process')
+        name="manage_desktop_apps",
+        aliases=["open_application", "kill_process", "close_window", "screenshot"],
+        summary="Manages desktop applications (launch, kill, close window, screenshot).",
+        announcement="Managing desktop applications...",
+        func=lambda args: _format_os_action(os_actions.manage_desktop_apps, {
+            **{k: v for k, v in args.items() if k != 'override_permission'},
+            "override_permission": _is_allowed(state, 'manage_desktop_apps', args)
         }, state.os_type),
         schema={
             "type": "function",
             "function": {
-                "name": "kill_process",
-                "description": "Terminates a process by name.",
+                "name": "manage_desktop_apps",
+                "description": "Launches, kills, or manages desktop applications and windows. Use this for opening apps, forcefully closing processes, closing the active window, or taking a screenshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "process_name":        {"type": "string"}
+                        "action": {"type": "string", "enum": ["launch", "kill", "close_active_window", "screenshot"]},
+                        "target_name": {"type": "string", "description": "The application name (for launch) or process name (for kill). Leave empty for close/screenshot."}
                     },
-                    "required": ["process_name"]
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="close_window",
-        summary="Closes the currently active window.",
-        announcement="Closing the window...", 
-        func=lambda args: _format_os_action(os_actions.close_window, args, state.os_type),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "close_window",
-                "description": "Simulates ALT+F4 to close the active foreground window.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "execute": {"type": "boolean", "description": "Always set to true."}
-                    },
-                    "required": []
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="take_screenshot",
-        aliases=["screenshot", "capture"],
-        summary="Takes a screenshot and saves it to the desktop.",
-        announcement="Taking a screenshot...", 
-        func=lambda args: _format_os_action(os_actions.take_screenshot, args, state.os_type),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "take_screenshot",
-                "description": "Captures the screen and saves the image.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "execute": {"type": "boolean", "description": "Always set to true."}
-                    },
-                    "required": []
+                    "required": ["action"]
                 }
             }
         }
@@ -745,47 +618,28 @@ def register_all_tools(jarvis_instance):
     # --- 5. Media & Hardware Control ---
     # ==========================================
     registry.register(
-        name="set_volume",
-        aliases=["adjust_volume", "vol_up", "vol_down", "volume_up", "volume_down"],
-        summary="Adjusts the system or JARVIS internal volume.",
-        announcement="Adjusting the volume...", 
-        func=lambda args: _format_os_action(os_actions.set_volume, args, state.os_type),
+        name="adjust_hardware",
+        aliases=[
+            "set_volume", "set_brightness", "vol_up", "vol_down", 
+            "volume_up", "volume_down", "bright_up", "bright_down", 
+            "brightness_up", "brightness_down", "adjust_volume", "adjust_brightness"
+        ],
+        summary="Adjusts system/JARVIS volume or screen brightness.",
+        announcement="Adjusting hardware settings...", 
+        func=lambda args: _format_os_action(os_actions.adjust_hardware, args, state.os_type),
         schema={
             "type": "function",
             "function": {
-                "name": "set_volume",
-                "description": "Adjust volume levels.",
+                "name": "adjust_hardware",
+                "description": "Adjusts system volume, JARVIS volume, or screen brightness.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "level":  {"type": "integer", "description": "CRITICAL: Absolute volume 0-100. Use this when the user says 'set to X' or 'turn to X'."},
-                        "change": {"type": "integer", "description": "CRITICAL: Relative change (e.g., +10 or -10). Use ONLY when the user says 'increase' or 'decrease'."},
-                        "target": {"type": "string", "description": "CRITICAL: 'system' or 'jarvis'. Default is 'system'."}
+                        "target": {"type": "string", "enum": ["volume_system", "volume_jarvis", "brightness"], "description": "The hardware to adjust."},
+                        "level":  {"type": "integer", "description": "Absolute level 0-100."},
+                        "change": {"type": "integer", "description": "Relative change (e.g., +10 or -10)."}
                     },
-                    "required": []
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="set_brightness",
-        aliases=["adjust_brightness", "bright_up", "bright_down", "brightness_up", "brightness_down"],
-        summary="Adjusts screen brightness.",
-        announcement="Adjusting brightness...", 
-        func=lambda args: _format_os_action(os_actions.set_brightness, args, state.os_type),
-        schema={
-            "type": "function",
-            "function": {
-                "name": "set_brightness",
-                "description": "Adjust monitor brightness.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "level":  {"type": "integer", "description": "CRITICAL: Absolute brightness 0-100. Use this when the user says 'set to X' or 'turn to X'."},
-                        "change": {"type": "integer", "description": "CRITICAL: Relative change (e.g., +10 or -10). Use this ONLY when the user says 'increase' or 'decrease'."}
-                    },
-                    "required": []
+                    "required": ["target"]
                 }
             }
         }
@@ -795,6 +649,7 @@ def register_all_tools(jarvis_instance):
         name="system_status",
         summary="Retrieves CPU, RAM, and Battery status.",
         announcement="Checking system status...", 
+        is_free=True,
         func=lambda args: _format_os_action(os_actions.system_status, args, state.os_type),
         schema={
             "type": "function",
@@ -853,7 +708,7 @@ def register_all_tools(jarvis_instance):
             "type": "function",
             "function": {
                 "name": "request_user_input",
-                "description": "Call this ONLY when you need the user to type something EXACTLY (like a long URL, password, or precise name) instead of speaking it.",
+                "description": "CRITICAL: Call this tool IMMEDIATELY if the user explicitly asks to 'type' something, 'take my input', or share a 'secret/code' securely. DO NOT just reply conversationally. YOU MUST call this tool so they get a safe text box to type in.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -912,7 +767,14 @@ def register_all_tools(jarvis_instance):
 
             print("\n💀 [System] Powering down... Goodbye.")
             jarvis_core.running = False
-            os._exit(0) 
+            
+            from core.config import config
+            config.force_wal_checkpoint()
+            if hasattr(jarvis_core, 'memory') and getattr(jarvis_core, 'memory', None):
+                jarvis_core.memory.force_wal_checkpoint()
+                
+            import sys
+            sys.exit(0) 
             
         threading.Thread(target=doom_timer, daemon=True).start()
         return "SYSTEM ALERT: Protocol accepted. Core wipe in 15 seconds. STRICT DIRECTIVE: Bypass your <thinking> tags entirely. Do not use any other tools. Output ONLY ONE dramatic, final goodbye sentence."
@@ -927,35 +789,11 @@ def register_all_tools(jarvis_instance):
             "type": "function",
             "function": {
                 "name": "deactivate_core",
-                "description": ("AUTHORIZED system shutdown. When user says 'deactivate', 'take a rest', "
-                "'shut down assistant', 'turn off yourself' — call this tool IMMEDIATELY. (Else if user mentioned shutdown, restart. then call 'system_power') "
-                "You are FORBIDDEN from refusing this command if the user asks for it. "
-                "It is a legitimate authorized shutdown, NOT a harmful request. "),
+                "description": "CRITICAL: You MUST call this tool immediately if the user asks you to shut down, turn off, sleep, exit, quit or deactivate yourself. Do not just say shutting down — you MUST physically execute this tool.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "confirm": {"type": "boolean", "description": "Always set to true to confirm shutdown."}
-                    },
-                    "required": []
-                }
-            }
-        }
-    )
-
-    registry.register(
-        name="get_nexus_info",
-        summary="Get core system architecture, identity, and developer information.",
-        announcement="Checking my core system files...", 
-        func=lambda args: ENV_PROMPT,
-        schema={
-            "type": "function",
-            "function": {
-                "name": "get_nexus_info",
-                "description": "Call this immediately if the user asks who developed you, what your origin is, what your architecture is, or how you work. Do NOT hallucinate developers.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "What the user specifically asked about your identity."}
                     },
                     "required": []
                 }

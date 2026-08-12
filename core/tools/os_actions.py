@@ -34,7 +34,7 @@ except ImportError:
 # =====================================================================
 
 try: 
-    from core.config import config, BASE_DIR
+    from core.config import config, BASE_DIR, DESKTOP_DIR
 except ImportError as e:
     logging.error(f"❌ Could not import centralized config. {e}")
     sys.exit(1)
@@ -231,6 +231,9 @@ def youtube_action(params):
     os_type = params.get("os_type", "").lower()
     
     if not query:
+        if action == "play":
+            return False, "Error: You must provide a 'query' parameter to play a video or music. Try calling the tool again with a specific query.", None
+        
         logging.info(f"Executing: Open YouTube Homepage on OS: {os_type}")
         webbrowser.open("https://www.youtube.com")
         return True, "Success: Opened YouTube homepage. Tell the user you opened it.", None
@@ -388,7 +391,7 @@ def set_brightness(params):
 
 
 def take_screenshot(params):
-    save_dir = config.get("desktop_dir") or str(Path.home() / "Desktop")
+    save_dir = config.get("desktop_dir") or str(DESKTOP_DIR)
     ast_name = config.get("assistant_name", "System")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{ast_name}_Screenshot_{timestamp}.png"
@@ -445,23 +448,30 @@ def request_user_input(params):
     prompt_text = params.get("prompt_text", "Jarvis requires your input:")
     
     try:
-        # Create a hidden root window for the Dialog
-        root = tk.Tk()
-        root.withdraw() 
-        # Force the window to appear above all others
-        root.attributes('-topmost', True)
-        
-        # Open the input dialog and halt execution until user submits
-        user_input = simpledialog.askstring(title, prompt_text, parent=root)
-        
-        # Destroy the window after completion
-        root.destroy()
-        
-        if user_input is not None:
-            return True, f"User manually inputted: {user_input}", user_input
-        else:
-            return False, "Error: User canceled the input dialog.", None
+        import threading
+        is_main_thread = threading.current_thread() is threading.main_thread()
+
+        # MODIFIED: Validate main thread before calling tkinter — Tkinter deadlocks when called from background threads
+        if tk and simpledialog and is_main_thread:
+            # Create a hidden root window for the Dialog
+            root = tk.Tk()
+            root.withdraw() 
+            # Force the window to appear above all others
+            root.attributes('-topmost', True)
             
+            # Open the input dialog and halt execution until user submits
+            user_input = simpledialog.askstring(title, prompt_text, parent=root)
+            
+            # Destroy the window after completion
+            root.destroy()
+            
+            if user_input is not None:
+                return True, f"User manually inputted: {user_input}", user_input
+            else:
+                return False, "Error: User canceled the input dialog.", None
+        else:
+            # Not on main thread or tkinter unavailable — fall through to OS native fallback
+            raise RuntimeError("Tkinter unavailable or not on main thread. Using OS native fallback.")
     except Exception as e:
         logging.warning(f"tkinter failed: {e}. Falling back to OS native input.")
         os_type = params.get("os_type", "").lower()
@@ -921,23 +931,21 @@ def run_scenario(params):   #? (Hmody: created with one goal, breaking limits)
                 
                 logging.info(f"Fuzzy matched scenario '{scenario_name}' to '{best_match}' (Ext: {ext}) with score {score}")
                 
-                # Enforce strict execution for .ps1 and .sh in the background
+                # MODIFIED: Security hardening — use '--' to prevent option injection in bash,
+                # and enforce shell=False on all platforms
                 if ext == '.ps1':
-                    # Use WindowStyle Hidden to prevent PowerShell console flashing
-                    cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script_path]
+                    cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script_path)]
                 elif ext == '.sh':
-                    # Standard secure execution in Linux environment
-                    cmd = ["bash", script_path]
+                    cmd = ["bash", "--", str(script_path)]  # '--' blocks option injection via script name
                 else:
-                    # Extra security layer for invalid file types
                     return False, f"Error: Unsupported script type '{ext}'. Please use strictly .ps1 for Windows or .sh for Linux.", None
                 
-                # Execute script in the background
+                # Execute script in the background — always shell=False
                 if os_type == "windows":
                     creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+                    subprocess.Popen(cmd, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
                 else:
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(cmd, shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                 return True, f"Successfully executed scenario: {best_match}.", None
 
@@ -1112,17 +1120,26 @@ def kill_process(params):
     if process_name.lower() == "all":
         count = 0
         me = psutil.Process()
-        win_ignore = ["explorer.exe", "cmd.exe", "python.exe"]
+        # MODIFIED: Expanded critical system process ignore list + added ollama to prevent JARVIS self-destruct
+        win_ignore = [
+            "explorer.exe", "cmd.exe", "python.exe", "svchost.exe", "csrss.exe",
+            "smss.exe", "winlogon.exe", "services.exe", "lsass.exe", "conhost.exe",
+            "taskmgr.exe", "ollama.exe", "ollama_llama_server.exe"
+        ]
         lin_ignore = ["bash", "gnome-shell", "systemd", "python", "python3", "Xorg", "wayland"]
         ignore_list = win_ignore if os_type == "windows" else lin_ignore
 
-        for proc in psutil.process_iter(['pid', 'name', 'username']):
+        for proc in psutil.process_iter(['pid', 'name']):
             try:
-                if (proc.info['username'] == me.username() and proc.pid != me.pid and 
-                    proc.info['name'] and proc.info['name'].lower() not in ignore_list):
-                        proc.terminate()
-                        count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+                # MODIFIED: Call username() inside try-block — AccessDenied crashes the entire loop otherwise
+                proc_user = proc.username()
+                proc_name_val = proc.info.get('name', '')
+                if (proc_user == me.username() and proc.pid != me.pid and
+                        proc_name_val and proc_name_val.lower() not in ignore_list):
+                    proc.terminate()
+                    count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
         return True, f"Success: Closed {count} applications.", None
     
     killed = False
@@ -1181,14 +1198,16 @@ def system_power(params):
             if os_type == "windows":
                 subprocess.run(["shutdown", "/s", "/t", "20"], check=True)
             else:
-                subprocess.Popen("sleep 20 && shutdown -h now", shell=True) # extra 5 secs for TTFT & TTS spelling
+                # MODIFIED: Replaced shell=True string command with list-based Popen to prevent injection
+                subprocess.Popen(["bash", "-c", "sleep 20 && shutdown -h now"], shell=False)
             dramatic_prompt = "SYSTEM ACTION: OS Shutdown initiated in 15 seconds. STRICT DIRECTIVE: Bypass your <thinking> tags entirely. Output EXACTLY ONE dramatic, poetic goodbye sentence immediately."
 
         elif action == "restart":
             if os_type == "windows":
                 subprocess.run(["shutdown", "/r", "/t", "20"], check=True)
             else:
-                subprocess.Popen("sleep 20 && shutdown -r now", shell=True)
+                # MODIFIED: Replaced shell=True string command with list-based Popen to prevent injection
+                subprocess.Popen(["bash", "-c", "sleep 20 && shutdown -r now"], shell=False)
             dramatic_prompt = "SYSTEM ACTION: OS Restart initiated in 15 seconds. STRICT DIRECTIVE: Bypass your <thinking> tags entirely. Output EXACTLY ONE dramatic 'see you soon' sentence immediately."
 
         elif action == "lock":
@@ -1218,3 +1237,103 @@ def system_power(params):
         logging.error(f"System Power Error: {e}")
         print(f"System Power Error: {e}")
         return False, f"Failed to execute {action}: {e}", None
+
+# =====================================================================
+# Unified Routing Functions
+# =====================================================================
+
+def adjust_hardware(params):
+    target = params.get("target")
+    level = params.get("level")
+    change = params.get("change")
+    if target == 'brightness':
+        return set_brightness(params)
+    elif target == 'volume_jarvis':
+        new_params = params.copy()
+        new_params["target"] = "jarvis"
+        return set_volume(new_params)
+    else:
+        new_params = params.copy()
+        new_params["target"] = "system"
+        return set_volume(new_params)
+
+def open_browser_visuals(params):
+    action = params.get("action")
+    target = params.get("target")
+    if action == 'google_image_search':
+        new_params = params.copy()
+        new_params["query"] = target
+        return google_search(new_params)
+    elif action == 'visit_url':
+        new_params = params.copy()
+        new_params["site_name"] = target
+        return open_website(new_params)
+    return False, "Error: Invalid action for open_browser_visuals", None
+
+def manage_desktop_apps(params):
+    action = params.get("action")
+    target_name = params.get("target_name")
+    
+    # NEW: Fallback inference for legacy alias calls (e.g., open_application, kill_process)
+    if not action:
+        if "app_name" in params:
+            return open_application(params)
+        elif "process_name" in params:
+            return kill_process(params)
+        elif params.get("execute") is not None:
+            return close_window(params) if "close" in str(params) else take_screenshot(params)
+
+    if action == 'launch':
+        new_params = params.copy()
+        new_params["app_name"] = target_name
+        return open_application(new_params)
+    elif action == 'kill':
+        new_params = params.copy()
+        new_params["process_name"] = target_name
+        return kill_process(new_params)
+    elif action == 'close_active_window':
+        return close_window(params)
+    elif action == 'screenshot':
+        return take_screenshot(params)
+    return False, "Error: Invalid action for manage_desktop_apps", None
+
+def mutate_filesystem(params):
+    action = params.get("action")
+    path = params.get("path") or params.get("file_path") or params.get("target_path")
+    
+    # Read both new explicit args and fallback to old ones if necessary
+    content = params.get("content") or params.get("content_or_old_str")
+    old_string = params.get("old_string") or params.get("content_or_old_str")
+    new_string = params.get("new_string") or params.get("new_str_or_dest")
+    destination_path = params.get("destination_path") or params.get("new_str_or_dest")
+    
+    # NEW: Fallback inference if invoked via alias
+    if not action:
+        if "content" in params and ("file_path" in params or "path" in params):
+            return write_file(params)
+        elif "old_string" in params and "new_string" in params:
+            return edit_file(params)
+        elif "destination_path" in params:
+            return manage_workspace(params)
+
+    if action == 'create_file':
+        new_params = params.copy()
+        new_params["file_path"] = path
+        new_params["content"] = content
+        return write_file(new_params)
+    elif action == 'edit_string':
+        new_params = params.copy()
+        new_params["file_path"] = path
+        new_params["old_string"] = old_string
+        new_params["new_string"] = new_string
+        # NEW: Preserve replace_all capability if passed
+        if "replace_all" in params:
+            new_params["replace_all"] = params["replace_all"]
+        return edit_file(new_params)
+    elif action in ['mkdir', 'move', 'delete']:
+        new_params = params.copy()
+        new_params["target_path"] = path
+        new_params["destination_path"] = destination_path
+        return manage_workspace(new_params)
+    return False, f"Error: Invalid action '{action}' for mutate_filesystem", None
+

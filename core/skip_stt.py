@@ -192,8 +192,8 @@ class SkipSTTCore(JARVISCore):
                     "model": self.llm_client.normal_model,
                     "messages": warmup_messages,
                     "stream": False,
-                    "keep_alive": get_setting('llm_keep_alive_high_perf', '15m'),
-                    "tools": warmup_tools if self.llm_client.supports_native_tools else None,
+                    "keep_alive": f"{get_setting('llm_keep_alive_high_perf', 15)}m",
+                    "tools": warmup_tools,
                     "options": {
                         "temperature": 0.1,
                         "num_predict": 1,
@@ -210,8 +210,21 @@ class SkipSTTCore(JARVISCore):
                     timeout=get_setting('warmup_timeout', 60)
                 )
 
+                if response.status_code == 400 and "tool" in response.text.lower():
+                    error_msg = f"Model '{self.llm_client.normal_model}' does NOT support Native JSON Tools! JARVIS v1.3 requires native tools."
+                    print(f"   [System] ❌ FATAL: {error_msg}")
+                    logger.error(error_msg)
+                    break
+
+                response.raise_for_status()  # Force HTTP errors to trigger the except block and sleep
+
                 if response.ok:
                     print("   [System] 🔥 LLM Pre-ignition & Immutable Cache complete. Ready for instant replies.")
+                    # Cache Key generation for warmup debugging
+                    import hashlib
+                    sys_hash = hashlib.md5(static_sys.encode()).hexdigest()[:8]
+                    tools_hash = hashlib.md5(json.dumps(warmup_tools, sort_keys=True).encode()).hexdigest()[:8] if warmup_tools else "none"
+                    print(f"   🔑 [Cache Key - Warmup] sys={sys_hash} tools={tools_hash}")
                     break
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -262,6 +275,9 @@ class SkipSTTCore(JARVISCore):
 
                 print(f"\n🚀 Executing: {command}")
                 self._is_currently_speaking_tool_intro = False
+
+                # Stamp user input time for WatchDog._is_golden_moment() gate
+                self._last_user_input_time = time.time()
 
                 response = self.process_command(command)
                 if response:

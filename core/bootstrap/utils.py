@@ -18,6 +18,9 @@ def enforce_single_instance(lock_name: str, window_title: str = None) -> bool:
         kernel32 = ctypes.windll.kernel32
         mutex = kernel32.CreateMutexW(None, False, lock_name)
         if kernel32.GetLastError() == 183: # ERROR_ALREADY_EXISTS
+            # MODIFIED: Close the opened handle to prevent kernel handle leak.
+            # CreateMutexW always opens a handle even when ERROR_ALREADY_EXISTS fires.
+            kernel32.CloseHandle(mutex)
             if window_title:
                 user32 = ctypes.windll.user32
                 hwnd = user32.FindWindowW(None, window_title)
@@ -36,5 +39,11 @@ def enforce_single_instance(lock_name: str, window_title: str = None) -> bool:
             fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _ACTIVE_LOCKS.append(lock_file)
             return True
-        except (IOError, BlockingIOError):
+        except (IOError, BlockingIOError, OSError):
+            # MODIFIED: Close the un-locked file handle to prevent file descriptor leak
+            try:
+                lock_file.close()
+            except Exception:
+                pass
             return False
+

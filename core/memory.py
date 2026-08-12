@@ -53,6 +53,7 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     STOPPED = "stopped"
+    MISSED = "missed"
 
     @classmethod
     def is_valid_transition(cls, current_status: str, new_status: str) -> bool:
@@ -60,7 +61,7 @@ class TaskStatus(Enum):
         Prevents invalid transitions. Cannot modify a task that has 
         reached a terminal state.
         """
-        terminal_states = [cls.COMPLETED.value, cls.FAILED.value, cls.STOPPED.value]
+        terminal_states = [cls.COMPLETED.value, cls.FAILED.value, cls.STOPPED.value, cls.MISSED.value]
         if current_status in terminal_states:
             return False
         return True
@@ -72,7 +73,7 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
     def get_ollama_embedding(self, text: str) -> np.ndarray:
         """Talks to Ollama to convert text into embeddings (Vectors) based on user settings"""
         try:
-            model = get_setting("embedding_model", "all-minilm")
+            model = get_setting("embedding_model", "all-minilm").split("/")[-1]
             base_url = get_setting("local_api_url", "http://localhost:11434")
             api_url = f"{base_url.rstrip('/')}/api/embeddings"
             
@@ -90,8 +91,10 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
             logging.error(f"[Memory] Ollama Embedding Error: {e}")
         return None
     def __init__(self):
-        self.db_lock = threading.Lock()
+        # MODIFIED: Use RLock (reentrant) to prevent self-deadlocks when one locked method calls another
+        self.db_lock = threading.RLock()
         self.ram_upcoming_tasks = []
+        self.session_missed_tasks = []
         
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
@@ -105,7 +108,7 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
         self.faiss_index = None
 
         if EMBEDDINGS_AVAILABLE:
-            model = get_setting("embedding_model", "all-minilm")
+            model = get_setting("embedding_model", "all-minilm").split("/")[-1]
             print(f"   [Memory] ✅ Embeddings configured via Ollama ({model})")
             self.embedding_model = True
             try:
@@ -302,9 +305,7 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
         category = category.lower()
         
         if category == 'fact':
-            entity_name = self._extract_keywords(content, max_keywords=2)
-            if not entity_name:
-                entity_name = "General Fact"
+            entity_name = self._extract_entity(content)
                 
             attributes = {"details": content, "source": "save_to_memory"}
             return self._store_knowledge(
@@ -344,6 +345,11 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
     # =================================================================
     def store_memory(self, content: str, title: str = None, memory_type: str = 'episodic',
                      importance: int = 5, tags: List[str] = None, metadata: Dict = None) -> int:
+        # MODIFIED: Compute embedding OUTSIDE the DB lock — HTTP call (1-5s) must never hold the mutex
+        embedding_vector = None
+        if self.embedding_model and self.faiss_index is not None:
+            embedding_vector = self.get_ollama_embedding(content)
+
         with self.db_lock:
             try:
                 cursor = self.conn.cursor()
@@ -366,12 +372,10 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
                 
                 memory_id = cursor.lastrowid
                 
-                # Insert the vector into FAISS
-                if self.embedding_model and self.faiss_index is not None:
-                    embedding_vector = self.get_ollama_embedding(content)
-                    if embedding_vector is not None:
-                        faiss_id = np.array([memory_id], dtype=np.int64)
-                        self.faiss_index.add_with_ids(embedding_vector, faiss_id)
+                # Insert the pre-computed vector into FAISS (computed before lock was acquired)
+                if embedding_vector is not None:
+                    faiss_id = np.array([memory_id], dtype=np.int64)
+                    self.faiss_index.add_with_ids(embedding_vector, faiss_id)
                     # Save the index after modification to ensure data persistence
                     faiss.write_index(self.faiss_index, str(self.faiss_index_path))
                 
@@ -395,12 +399,17 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
 
     def recall_memory(self, query: str, limit: int = 5, memory_type: str = None, 
                       min_importance: float = 0.0, use_semantic: bool = True) -> List[Dict]:
+        # MODIFIED: Compute query embedding OUTSIDE the DB lock — Ollama HTTP must never hold the mutex
+        query_vec = None
+        if use_semantic and self.embedding_model:
+            query_vec = self.get_ollama_embedding(query)
+
         with self.db_lock:
             try:
                 cursor = self.conn.cursor()
                 memories = []
-                if use_semantic and self.embedding_model:
-                    memories = self._semantic_search(query, limit, memory_type, min_importance, cursor)
+                if query_vec is not None and self.faiss_index is not None:
+                    memories = self._semantic_search(query_vec, limit, memory_type, min_importance, cursor)
                 
                 if not memories:
                     memories = self._keyword_search(query, limit, memory_type, min_importance, cursor)
@@ -508,7 +517,7 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     SELECT id, attributes FROM knowledge_base 
-                    WHERE entity = ? AND entity_type = ?
+                    WHERE LOWER(entity) = LOWER(?) AND entity_type = ?
                 ''', (entity, entity_type))
                 existing = cursor.fetchone()
                 timestamp = time.time()
@@ -759,67 +768,168 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
                 cursor.execute('''
                     SELECT * FROM tasks 
                     WHERE status = ? AND due_date IS NOT NULL 
-                    AND due_date BETWEEN ? AND ?
+                    AND due_date <= ?
                     ORDER BY due_date ASC
-                ''', (TaskStatus.CREATED.value, current_time, future_time))
+                ''', (TaskStatus.CREATED.value, future_time))
                 
                 rows = cursor.fetchall()
                 self.ram_upcoming_tasks = [self._row_to_dict_with_cursor(row, cursor) for row in rows]
         except Exception as e:
             print(f"   [Memory] ❌ Error syncing tasks: {e}")
             logging.error(f"[Memory] Error syncing tasks: {e}")
-            
+
+    def reconcile_stale_tasks(self) -> List[Dict]:
+        """
+        Called ONCE at boot by WatchDog.
+        Marks ALL 'created' tasks whose due_date is in the past as 'missed' 
+        in a single atomic DB transaction.
+
+        Returns the list of newly-missed tasks so WatchDog can announce them
+        once and discard them — they are never loaded into RAM again.
+
+        Architecture note (backend-architect): This is the authoritative
+        reconciliation boundary. The WatchDog is the only caller. Running
+        this on startup guarantees the in-memory monitor never sees stale
+        past-due tasks that should have been closed out in a prior session.
+        """
+        # Any task whose due_date is in the past upon boot is considered missed.
+        stale_cutoff = time.time()
+        missed_tasks: List[Dict] = []
+
+        try:
+            with self.db_lock:
+                cursor = self.conn.cursor()
+
+                # Fetch all tasks that are still 'created' but past the stale cutoff
+                cursor.execute(
+                    '''
+                    SELECT * FROM tasks
+                    WHERE status = ?
+                      AND due_date IS NOT NULL
+                      AND due_date < ?
+                    ORDER BY due_date ASC
+                    ''',
+                    (TaskStatus.CREATED.value, stale_cutoff)
+                )
+                rows = cursor.fetchall()
+
+                if not rows:
+                    return []
+
+                missed_tasks = [self._row_to_dict_with_cursor(row, cursor) for row in rows]
+                stale_ids = [t['id'] for t in missed_tasks]
+
+                # Bulk-update all stale tasks to MISSED in one transaction
+                placeholders = ','.join('?' for _ in stale_ids)
+                cursor.execute(
+                    f"UPDATE tasks SET status = ? WHERE id IN ({placeholders})",
+                    [TaskStatus.MISSED.value] + stale_ids
+                )
+                self.conn.commit()
+
+                print(
+                    f"   [Memory] 🗂️ Boot reconciliation: {len(stale_ids)} stale task(s) → MISSED: "
+                    + ', '.join(f"#{t['id']} '{t['title']}'" for t in missed_tasks)
+                )
+                logging.info(
+                    f"[Memory] Boot reconciliation marked {len(stale_ids)} task(s) as MISSED: "
+                    + str(stale_ids)
+                )
+
+        except Exception as e:
+            print(f"   [Memory] ❌ Error during boot reconciliation: {e}")
+            logging.error(f"[Memory] Boot reconciliation failed: {e}", exc_info=True)
+
+        return missed_tasks
+
     def get_time_aware_context(self) -> str:
         """
         Injects task context into the System Prompt (24h past & 48h future).
         """
         try:
             current_time = time.time()
-            past_24h = current_time - (24 * 3600)
-            future_48h = current_time + (48 * 3600)
+            past_12h = current_time - (12 * 3600)
+            future_24h = current_time + (24 * 3600)
             
             context_string = "--- TIME-AWARE TASK CONTEXT ---\n"
             
             with self.db_lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    SELECT title, due_date, status, priority FROM tasks 
-                    WHERE due_date BETWEEN ? AND ?
+                    SELECT id, title, due_date, status, priority FROM tasks 
+                    WHERE status = ? AND due_date <= ?
                     ORDER BY due_date ASC
-                ''', (current_time, future_48h))
+                ''', (TaskStatus.CREATED.value, future_24h))
                 
                 upcoming = cursor.fetchall()
                 if upcoming:
-                    context_string += "[UPCOMING TASKS (Next 48h)]:\n"
+                    context_string += "[UPCOMING TASKS (Next 24h)]:\n"
                     for row in upcoming:
-                        due = datetime.fromtimestamp(row[1]).strftime('%Y-%m-%d %H:%M')
-                        context_string += f"- [{row[2].upper()}] Priority {row[3]}: {row[0]} (Due: {due})\n"
+                        due = datetime.fromtimestamp(row[2]).strftime('%Y-%m-%d %H:%M')
+                        context_string += f"- [ID: {row[0]}] [{row[3].upper()}] Priority {row[4]}: {row[1]} (Due: {due})\n"
+                
+                # Fetch dynamically identified MISSED tasks in this session
+                if hasattr(self, 'session_missed_tasks') and self.session_missed_tasks:
+                    context_string += "\n[MISSED TASKS (Automatically marked due to timeout)]:\n"
+                    context_string += "(Instruction: You MUST proactively inform the user about these missed tasks in your next response!)\n"
+                    for missed_task in self.session_missed_tasks:
+                        due = datetime.fromtimestamp(missed_task['due_date']).strftime('%Y-%m-%d %H:%M')
+                        context_string += f"- [{TaskStatus.MISSED.value.upper()}] Priority {missed_task['priority']}: {missed_task['title']} (Was due: {due})\n"
                 
                 cursor.execute('''
-                    SELECT title, completed_at, status FROM tasks 
+                    SELECT id, title, completed_at, status FROM tasks 
                     WHERE (completed_at BETWEEN ? AND ?) OR (created_at BETWEEN ? AND ?)
                     ORDER BY created_at DESC LIMIT 5
-                ''', (past_24h, current_time, past_24h, current_time))
+                ''', (past_12h, current_time, past_12h, current_time))
                 
                 recent = cursor.fetchall()
                 if recent:
-                    context_string += "\n[RECENTLY MODIFIED/COMPLETED TASKS (Last 24h)]:\n"
+                    context_string += "\n[RECENTLY MODIFIED/COMPLETED TASKS (Last 12h)]:\n"
                     for row in recent:
-                        context_string += f"- [{row[2].upper()}] {row[0]}\n"
+                        task_status = row[3]
+                        if task_status in (TaskStatus.COMPLETED.value, TaskStatus.MISSED.value):
+                            context_string += f"- [{task_status.upper()}] {row[1]}\n"
+                        else:
+                            context_string += f"- [ID: {row[0]}] [{task_status.upper()}] {row[1]}\n"
                         
-            return context_string if (upcoming or recent) else ""
-        except Exception:
+            has_missed = hasattr(self, 'session_missed_tasks') and len(self.session_missed_tasks) > 0
+            return context_string if (upcoming or recent or has_missed) else ""
+        except Exception as e:
+            print(f"Error generating time aware context: {e}")
             return ""
 
     # =================================================================
     # Internal Helper Methods
     # =================================================================
+    _ENTITY_TRIGGERS = [
+        re.compile(r"\bmy\s+name(?:'s|\s+is)\s+([a-zA-Z]{2,20})", re.IGNORECASE),
+        re.compile(r"\bcall\s+me\s+([a-zA-Z]{2,20})", re.IGNORECASE),
+        re.compile(r"\bmy\s+(?:dog|cat|pet|puppy|kitten)\b,?\s*(?:(?:is\s+)?(?:named|called)\s+)?([a-zA-Z]{2,20})", re.IGNORECASE),
+        re.compile(r"\b(?:i have|i've got|i got)\s+a\s+(?:dog|cat|pet|puppy|kitten)\b,?\s*(?:(?:is\s+)?(?:named|called)\s+)?([a-zA-Z]{2,20})", re.IGNORECASE),
+    ]
+
+    def _extract_entity(self, text: str) -> str:
+        """Trigger-pattern entity extraction for the 'fact' path.
+        Replaces frequency-based _extract_keywords, which has no notion
+        of grammatical role — it just returns the first content words
+        that survive the stopword/length filter, regardless of whether
+        they're the actual subject of the sentence.
+        Case-insensitive on purpose: STT transcripts don't reliably
+        preserve capitalization, so casing can't be used as a signal."""
+        for pattern in self._ENTITY_TRIGGERS:
+            match = pattern.search(text)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    return candidate
+        return "General Fact"
+
     def _extract_keywords(self, text: str, max_keywords: int = 10) -> str:
         stop_words = {'the', 'is', 'at', 'which', 'on', 'a', 'an', 'and', 'or', 'but', 'in', 'with', 'to', 'for', 'of', 'as', 'by'}
         words = re.findall(r'\b\w+\b', text.lower())
         word_freq = {}
         for word in words:
-            if word not in stop_words and len(word) > 3:
+            if word not in stop_words and len(word) > 2:
                 word_freq[word] = word_freq.get(word, 0) + 1
         sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
         return ' '.join([word for word, _ in sorted_words[:max_keywords]])
@@ -836,16 +946,15 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
                 break
         return summary.strip()
 
-    def _semantic_search(self, query: str, limit: int, memory_type: str, min_importance: float, cursor) -> List[Dict]:
-        if not self.embedding_model or self.faiss_index is None:
+    def _semantic_search(self, query_vec: np.ndarray, limit: int, memory_type: str, min_importance: float, cursor) -> List[Dict]:
+        """Accepts a pre-computed query vector (computed outside db_lock) to avoid network I/O inside the lock."""
+        if not self.embedding_model or self.faiss_index is None or query_vec is None:
             return []
         
         try:
             # Search via FAISS and fetch a slightly larger pool for re-ranking based on priority/importance
             fetch_limit = limit * 4 
-            query_embedding = self.get_ollama_embedding(query)
-            if query_embedding is None:
-                return []
+            query_embedding = query_vec  # MODIFIED: use pre-computed vector passed in as parameter
             
             distances, indices = self.faiss_index.search(query_embedding, fetch_limit)
             
@@ -1004,6 +1113,15 @@ class MemoryManager: #? (Hmody: for the records, my midterm tomorrow and im here
                 except Exception:
                     pass
         return result
+
+    def force_wal_checkpoint(self):
+        """Force a WAL checkpoint to truncate the .wal file and save all data to main DB."""
+        try:
+            with self.db_lock:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                print("💾 [MemoryManager] Database WAL checkpoint completed.")
+        except Exception as e:
+            print(f"⚠️ [MemoryManager] Error during WAL checkpoint: {e}")
 
     def __del__(self):
         try:

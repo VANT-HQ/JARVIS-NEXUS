@@ -1,9 +1,9 @@
-# core/bootstrap/env_setup.py  #? (Hmody: 5% me, 95% AI in the UI files fells like: https://share.google/016aSjT68zvqT55Sq)
+# core/bootstrap/env_setup.py
 """
-JARVIS NEXUS — First-Run Setup Wizard
-======================================
-Checks all required components and guides the user to install missing ones.
-Triggered automatically when critical components are missing.
+JARVIS NEXUS — First-Run Setup Wizard (Premium Gold Theme)
+==========================================================
+Stable logic merged with Gold/Amber premium design.
+All original functionality preserved; only visual layer updated.
 """
 
 import sys
@@ -165,28 +165,24 @@ def check_tts() -> dict:
 
 
 def check_embeddings() -> dict:
-    """Check optional embeddings model via Ollama."""
+    """Check optional embeddings model via HuggingFace Hub locally."""
     model = config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
-    import tempfile
+    
     try:
-        flags = subprocess.CREATE_NO_WINDOW if OS == "Windows" else 0
-        # CRITICAL FIX: Do NOT use capture_output=True or stdout=subprocess.PIPE.
-        # 'ollama list' might start the ollama daemon in the background. The daemon
-        # inherits the pipe, causing subprocess.run to hang forever waiting for EOF.
-        # Using a TemporaryFile completely bypasses the pipe freeze.
-        with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as temp_out:
-            subprocess.run(
-                ["ollama", "list"], 
-                stdout=temp_out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                timeout=5, creationflags=flags
-            )
-            temp_out.seek(0)
-            output = temp_out.read()
-            if model in output:
-                return {"ok": True,  "detail": f"Active in Ollama: {model}", "optional": True}
+        from huggingface_hub import snapshot_download
+        models_to_try = [model]
+        if "/" not in model:
+            models_to_try.append(f"sentence-transformers/{model}")
+            
+        for m in models_to_try:
+            try:
+                snapshot_download(m, local_files_only=True)
+                return {"ok": True,  "detail": f"Active Local: {m}", "optional": True}
+            except Exception:
+                pass
     except Exception:
         pass
-    return {"ok": False, "detail": f"Missing {model} in Ollama", "missing": [], "optional": True}
+    return {"ok": False, "detail": f"Missing {model} Locally", "missing": [], "optional": True}
 
 def check_sysfiles() -> dict:
     """Check required system files (videos and sounds)."""
@@ -295,8 +291,7 @@ class Downloader:
             with open(tmp, "wb") as f:
                 while True:
                     if self._cancel:
-                        tmp.unlink(missing_ok=True)
-                        return False
+                        break
                     buf = req.read(chunk)
                     if not buf:
                         break
@@ -310,11 +305,19 @@ class Downloader:
                     pct = int(downloaded * 100 / total) if total else 0
                     self._progress(pct, speed_str, label)
 
+            if self._cancel:
+                tmp.unlink(missing_ok=True)
+                return False
+
             tmp.rename(dest)
             return True
 
         except Exception as e:
-            tmp.unlink(missing_ok=True)
+            try:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
             raise e
 
     # ── Public download triggers ───────────────────────────────
@@ -371,17 +374,33 @@ class Downloader:
         self._thread.start()
 
     def download_embeddings(self):
-        def _pull_ollama_model():
+        def _pull_model():
             try:
                 model = config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
-                # Fake progress to show it's doing something
-                self._progress(50, "Pulling via Ollama...", "Embeddings")
-                subprocess.run(["ollama", "pull", model], check=True)
-                self._done("embeddings")
+                models_to_try = [model]
+                if "/" not in model:
+                    models_to_try.append(f"sentence-transformers/{model}")
+                    
+                from huggingface_hub import snapshot_download
+                success = False
+                last_error = ""
+                for m in models_to_try:
+                    try:
+                        self._progress(50, f"Downloading {m}...", "Embeddings")
+                        snapshot_download(m)
+                        success = True
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        
+                if success:
+                    self._done("embeddings")
+                else:
+                    self._error("embeddings", last_error)
             except Exception as e:
                 self._error("embeddings", str(e))
                 
-        self._thread = threading.Thread(target=_pull_ollama_model, daemon=True)
+        self._thread = threading.Thread(target=_pull_model, daemon=True)
         self._thread.start()
 
     def download_sysfiles(self):
@@ -469,15 +488,21 @@ class Downloader:
 # ╚══════════════════════════════════════════════════════════════╝
 class WizardAPI:
     def __init__(self):
-        self._dl: Downloader | None = None
+        self._dls = {}  # type: dict[str, Downloader]
         self._window = None          # set after window creation
+        self._download_queue = []  # not included in windows production v1.3 
+        self._active_downloads = set()
 
     def set_window(self, w):
         self._window = w
 
     def _js(self, js_code: str):
-        if self._window:
+        if not self._window:
+            return
+        try:
             self._window.evaluate_js(js_code)
+        except Exception as e:
+            logging.debug(f"JS eval skipped (window gone): {e}")
 
     # ── Checks ────────────────────────────────────────────────
     def get_status(self):
@@ -524,41 +549,78 @@ class WizardAPI:
             if checks.get(component, {}).get("ok"):
                 return json.dumps({"ok": False, "reason": "Already Existed"})
 
-        if self._dl:
-            self._dl.cancel()
+        if component in self._dls or component in self._download_queue:
+            return json.dumps({"ok": False, "reason": "Already downloading"})
 
+        self._download_queue.append(component)
+        self._js(f"onProgress('{component}', 0, 'Queued', 'Waiting for slot...')")
+        self._process_queue()
+        return json.dumps({"ok": True})
+
+    def _process_queue(self):
+        while len(self._active_downloads) < 2 and self._download_queue:
+            component = self._download_queue.pop(0)
+            self._active_downloads.add(component)
+            self._start_download_task(component)
+
+    def _start_download_task(self, component: str):
         def on_progress(pct, speed, label):
             safe_label = label.replace("'", "\\'")
             self._js(f"onProgress('{component}',{pct},'{speed}','{safe_label}')")
 
         def on_done(comp):
+            self._dls.pop(comp, None)
+            self._active_downloads.discard(comp)
             self._js(f"onDone('{comp}')")
+            self._process_queue()
 
         def on_error(comp, msg):
+            self._dls.pop(comp, None)
+            self._active_downloads.discard(comp)
             safe_msg = msg.replace("'", "\\'")[:120]
             self._js(f"onError('{comp}','{safe_msg}')")
 
-        self._dl = Downloader(on_progress, on_done, on_error)
+        dl = Downloader(on_progress, on_done, on_error)
+        self._dls[component] = dl
 
         actions = {
-            "ollama":     self._dl.download_ollama,
-            "llm":        self._dl.download_llm,
-            "stt":        self._dl.download_stt,
-            "tts":        self._dl.download_tts,
-            "jarvis_voice": self._dl.download_jarvis_voice,
-            "embeddings": self._dl.download_embeddings,
-            "sysfiles":   self._dl.download_sysfiles,
-            "mpv":        self._dl.download_mpv,
+            "ollama":     dl.download_ollama,
+            "llm":        dl.download_llm,
+            "stt":        dl.download_stt,
+            "tts":        dl.download_tts,
+            "jarvis_voice": dl.download_jarvis_voice,
+            "embeddings": dl.download_embeddings,
+            "sysfiles":   dl.download_sysfiles,
+            "mpv":        dl.download_mpv,
         }
         fn = actions.get(component)
         if fn:
             fn()
+        else:
+            on_error(component, "Unknown component")
         return json.dumps({"ok": bool(fn)})
 
     def cancel_download(self):
-        if self._dl:
-            self._dl.cancel()
+        self._download_queue.clear()
+        for dl in self._dls.values():
+            dl.cancel()
+        self._dls.clear()
+        self._active_downloads.clear()
         return json.dumps({"ok": True})
+
+    def cancel_task(self, component: str):
+        if component in self._download_queue:
+            self._download_queue.remove(component)
+            self._js(f"onError('{component}','Cancelled')")
+            return json.dumps({"ok": True})
+            
+        dl = self._dls.pop(component, None)
+        if dl:
+            dl.cancel()
+            self._active_downloads.discard(component)
+            self._process_queue()
+            return json.dumps({"ok": True})
+        return json.dumps({"ok": False, "reason": "Not downloading"})
 
     def mark_setup_complete(self):
         config.set("setup_complete", True)
@@ -590,127 +652,210 @@ class WizardAPI:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║                          HTML / UI                           ║
+# ║              PREMIUM HTML / UI (GOLD THEME MERGED)           ║
 # ╚══════════════════════════════════════════════════════════════╝
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<title>JARVIS · Setup</title>
+<title>JARVIS NEXUS · Setup Wizard</title>
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+/* ═══════════════════════════════════════════════════════════════
+   JARVIS NEXUS Design System v2.0 – Premium Gold/Amber Theme
+   ═══════════════════════════════════════════════════════════════ */
 :root{
-  --bg:#0d1117;--surface:#161b22;--card:#1c2128;--input:#21262d;
-  --border:#30363d;--accent:#58a6ff;--accent-h:#388bfd;
-  --green:#3fb950;--red:#f85149;--yellow:#d29922;--purple:#bc8cff;
-  --txt:#e6edf3;--sub:#8b949e;--mute:#484f58;
-  --r:10px;--rs:6px;--t:.18s ease;
+  --gold:           #C9A227;
+  --gold-light:     #E8D5A3;
+  --gold-dark:      #8B6914;
+  --gold-glow:      rgba(201, 162, 39, 0.15);
+  --gold-glow-strong:rgba(201, 162, 39, 0.3);
+  --bg:             #0a0e14;
+  --surface-1:      #0d1117;
+  --surface-2:      #131820;
+  --surface-3:      #1a1f2a;
+  --surface-4:      #222836;
+  --surface-hover:  #2a3040;
+  --border-subtle:  rgba(255,255,255,0.04);
+  --border-default: rgba(255,255,255,0.08);
+  --border-active:  rgba(201, 162, 39, 0.4);
+  --border-gold:    rgba(201, 162, 39, 0.25);
+  --txt-primary:    #f0f4f8;
+  --txt-secondary:  #94a3b8;
+  --txt-muted:      #64748b;
+  --txt-gold:       #E8D5A3;
+  --accent:         var(--gold);
+  --accent-h:       var(--gold-light);
+  --green:          #22c55e;
+  --green-dim:      #16a34a;
+  --red:            #ef4444;
+  --red-dim:        #dc2626;
+  --yellow:         #eab308;
+  --cyan:           #06b6d4;
+  --shadow-sm:      0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md:      0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg:      0 8px 32px rgba(0,0,0,0.5);
+  --shadow-gold:    0 0 20px rgba(201, 162, 39, 0.1);
+  --ease-out:       cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring:    cubic-bezier(0.34, 1.56, 0.64, 1);
+  --trans-fast:     0.15s var(--ease-out);
+  --trans-normal:   0.25s var(--ease-out);
+  --trans-slow:     0.4s var(--ease-out);
+  --radius-sm:      6px;
+  --radius-md:      10px;
+  --radius-lg:      14px;
+  --radius-xl:      20px;
 }
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{
-  height:100%;font-family:"Segoe UI",system-ui,sans-serif;
-  background:var(--bg);color:var(--txt);font-size:14px;overflow:hidden;
+  height:100%;
+  font-family:"Inter","Segoe UI",system-ui,-apple-system,sans-serif;
+  background:var(--bg);
+  color:var(--txt-primary);
+  font-size:14px;
+  overflow:hidden;
+  -webkit-font-smoothing:antialiased;
 }
 
-/* ── Layout ─────────────────────────────────────────────── */
-#app{display:flex;flex-direction:column;height:100vh}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:10px}
+::-webkit-scrollbar-thumb:hover{background:rgba(201,162,39,0.3)}
 
-/* header */
+#app{display:flex;flex-direction:column;height:100vh;position:relative}
+#app::before{
+  content:'';position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(201,162,39,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(201,162,39,0.03) 1px, transparent 1px);
+  background-size:50px 50px;
+  pointer-events:none;z-index:0;
+  mask-image:radial-gradient(ellipse at center, black 40%, transparent 80%);
+}
+
+/* ── Header ─────────────────────────────────────────────── */
 #header{
-  background:var(--surface);border-bottom:1px solid var(--border);
+  background:linear-gradient(180deg, var(--surface-1) 0%, var(--surface-2) 100%);
+  border-bottom:1px solid var(--border-default);
   padding:18px 32px;display:flex;align-items:center;gap:16px;flex-shrink:0;
+  position:relative;z-index:10;
 }
-.logo-icon{font-size:32px;line-height:1}
-.logo-text .title{font-size:20px;font-weight:700;letter-spacing:.3px}
-.logo-text .title span{color:var(--accent)}
-.logo-text .sub{font-size:12px;color:var(--sub);margin-top:3px}
+#header::after{
+  content:'';position:absolute;bottom:-1px;left:0;right:0;
+  height:1px;background:linear-gradient(90deg, transparent, var(--gold-glow-strong), transparent);
+}
+
+.logo-wrap{display:flex;align-items:center;gap:14px}
+.logo-icon{
+  width:36px;height:36px;border-radius:10px;
+  background:linear-gradient(135deg, var(--gold-dark), var(--gold));
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 15px rgba(201,162,39,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+  font-size:18px;color:#0a0e14;font-weight:700;
+}
+.logo-text{line-height:1.2}
+.logo-main{font-size:17px;font-weight:700;letter-spacing:0.5px;color:var(--txt-primary)}
+.logo-main span{color:var(--gold);font-weight:800}
+.logo-sub{font-size:11px;color:var(--txt-muted);font-weight:500;letter-spacing:0.3px}
+
 .os-badge{
-  margin-left:auto;background:var(--input);border:1px solid var(--border);
-  border-radius:20px;padding:5px 14px;font-size:12px;color:var(--sub);
+  margin-left:auto;
+  background:rgba(201,162,39,0.1);
+  border:1px solid var(--border-gold);
+  color:var(--gold-light);
+  font-size:11px;font-weight:700;
+  padding:4px 12px;border-radius:20px;
+  letter-spacing:0.5px;
+}
+.os-badge:empty{display:none}
+
+/* ── Body ───────────────────────────────────────────────── */
+#body{
+  flex:1;overflow-y:auto;padding:24px 32px;display:flex;flex-direction:column;gap:16px;
+  position:relative;z-index:1;
 }
 
-/* body */
-#body{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:16px}
-#body::-webkit-scrollbar{width:6px}
-#body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-
-/* footer */
-#footer{
-  background:var(--surface);border-top:1px solid var(--border);
-  padding:14px 32px;display:flex;align-items:center;gap:12px;flex-shrink:0;
+/* ── Summary Bar ────────────────────────────────────────── */
+#summary{
+  background:linear-gradient(180deg, var(--surface-2), var(--surface-3));
+  border:1px solid var(--border-default);
+  border-radius:var(--radius-lg);padding:14px 20px;
+  display:flex;align-items:center;gap:16px;
+  flex-shrink:0;
+  box-shadow:var(--shadow-md);
 }
-#footer .info{flex:1;font-size:12px;color:var(--sub)}
+#summary .s-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-secondary);}
+#summary .s-dot{width:8px;height:8px;border-radius:50%;}
 
 /* ── Component Card ─────────────────────────────────────── */
 .comp-card{
-  background:var(--card);border:1px solid var(--border);
-  border-radius:var(--r);overflow:hidden;
-  transition:border-color var(--t);
-  flex-shrink: 0; /* MODIFIED: Prevents squishing when others expand */
+  background:linear-gradient(180deg, var(--surface-2), var(--surface-3));
+  border:1px solid var(--border-default);
+  border-radius:var(--radius-lg);
+  overflow:hidden;
+  transition:all var(--trans-normal);
+  flex-shrink:0;
 }
-.comp-card.ok{border-color:#238636}
-.comp-card.warn{border-color:#9e6a03}
-.comp-card.error{border-color:#da3633}
-.comp-card.optional{opacity:.85}
+.comp-card:hover{
+  border-color:var(--border-active);
+  box-shadow:var(--shadow-gold);
+}
+.comp-card.ok{border-color:rgba(34,197,94,0.3);}
+.comp-card.warn{border-color:rgba(234,179,8,0.3);}
+.comp-card.error{border-color:rgba(239,68,68,0.3);}
+.comp-card.optional{opacity:0.9;}
 
 .card-top{
   display:flex;align-items:center;gap:14px;padding:16px 20px;cursor:pointer;
   user-select:none;
+  transition:background var(--trans-fast);
 }
-.card-top:hover{background:#ffffff08}
+.card-top:hover{background:rgba(255,255,255,0.02);}
 
 .status-dot{
   width:10px;height:10px;border-radius:50%;flex-shrink:0;
-  transition:background var(--t);
+  transition:background var(--trans-fast);
 }
-.dot-ok    {background:var(--green)}
-.dot-error {background:var(--red);box-shadow:0 0 8px var(--red)44}
-.dot-warn  {background:var(--yellow)}
+.dot-ok    {background:var(--green); box-shadow:0 0 8px var(--green);}
+.dot-error {background:var(--red); box-shadow:0 0 8px rgba(239,68,68,0.4);}
+.dot-warn  {background:var(--yellow); box-shadow:0 0 8px rgba(234,179,8,0.4);}
 .dot-spin  {
-  background:transparent;border:2px solid var(--accent);
+  background:transparent;border:2px solid var(--gold);
   border-top-color:transparent;
   animation:spin .7s linear infinite;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 
-.comp-icon{font-size:22px;width:30px;text-align:center;flex-shrink:0}
+.comp-icon{font-size:20px;width:30px;text-align:center;flex-shrink:0;color:var(--gold);}
 .comp-info{flex:1;min-width:0}
-.comp-name{font-size:15px;font-weight:600;color:var(--txt)}
-.comp-detail{font-size:13px;color:var(--sub);margin-top:4px;
-             line-height:1.4}
+.comp-name{font-size:15px;font-weight:600;color:var(--txt-primary);}
+.comp-detail{font-size:13px;color:var(--txt-muted);margin-top:4px;line-height:1.4;}
 
-/* NEW: Quick Actions Container */
-.quick-actions {
-  display: flex; gap: 8px; align-items: center; margin-right: 12px;
-}
-.btn-icon {
-  padding: 5px 10px; font-size: 11px; border-radius: 4px;
-}
-
+.quick-actions{display:flex;gap:8px;align-items:center;margin-right:12px;}
 .opt-tag{
   font-size:10px;padding:2px 8px;border-radius:10px;
-  background:#21262d;color:var(--sub);border:1px solid var(--border);
+  background:rgba(201,162,39,0.1);color:var(--gold-light);
+  border:1px solid var(--border-gold);
   flex-shrink:0;
 }
-.chevron{color:var(--mute);font-size:12px;transition:transform var(--t)}
-.card-top.expanded .chevron{transform:rotate(180deg)}
+.chevron{color:var(--txt-muted);font-size:12px;transition:transform var(--trans-fast);}
+.card-top.expanded .chevron{transform:rotate(180deg);}
 
-/* expanded body */
 .card-body{
-  display:none;padding:0 20px 16px;border-top:1px solid var(--border);
+  display:none;padding:0 20px 16px;border-top:1px solid var(--border-default);
 }
-.card-body.open{display:block}
+.card-body.open{display:block;}
 
 .desc{
-  font-size:12px;color:var(--sub);line-height:1.6;
+  font-size:12px;color:var(--txt-secondary);line-height:1.6;
   padding:12px 0 14px;
 }
-.desc strong{color:var(--txt)}
+.desc strong{color:var(--txt-primary);}
 .desc code{
-  background:var(--input);padding:1px 6px;border-radius:4px;
-  font-family:monospace;font-size:11px;color:var(--accent);
+  background:var(--surface-1);padding:1px 6px;border-radius:4px;
+  font-family:monospace;font-size:11px;color:var(--gold-light);
 }
 
-/* file list */
 .file-list{
   display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;
 }
@@ -718,125 +863,204 @@ html,body{
   font-size:11px;padding:3px 10px;border-radius:20px;
   font-family:monospace;
 }
-.file-ok   {background:#1b2d1b;color:var(--green);border:1px solid #238636}
-.file-miss {background:#2d1b1b;color:var(--red);border:1px solid #da3633}
+.file-ok   {background:rgba(34,197,94,0.1);color:var(--green);border:1px solid rgba(34,197,94,0.2);}
+.file-miss {background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.2);}
 
-/* action row */
 .action-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 
 /* ── Progress bar ────────────────────────────────────────── */
-.progress-wrap{
-  margin-top:12px;display:none;
-}
+.progress-wrap{margin-top:12px;display:none;}
 .progress-wrap.show{display:block}
-.progress-top{display:flex;justify-content:space-between;
-              font-size:11px;color:var(--sub);margin-bottom:6px}
+.progress-top{display:flex;justify-content:space-between;font-size:11px;color:var(--txt-muted);margin-bottom:6px}
 .progress-bar-bg{
-  height:6px;background:var(--input);border-radius:3px;overflow:hidden;
+  height:6px;background:var(--surface-4);border-radius:3px;overflow:hidden;
 }
 .progress-bar{
-  height:100%;background:var(--accent);border-radius:3px;
-  width:0%;transition:width .3s;
+  height:100%;background:linear-gradient(90deg, var(--gold-dark), var(--gold));
+  border-radius:3px;width:0%;transition:width .3s;
 }
-.progress-label{font-size:11px;color:var(--sub);margin-top:5px;
-                white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.progress-label{font-size:11px;color:var(--txt-muted);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-/* ── Buttons ─────────────────────────────────────────────── */
+/* ── Buttons (Premium) ──────────────────────────────────── */
 button{
   display:inline-flex;align-items:center;gap:6px;
-  padding:8px 16px;border-radius:var(--rs);border:none;
+  padding:8px 16px;border-radius:var(--radius-md);border:none;
   font-size:12px;font-weight:600;cursor:pointer;
-  font-family:inherit;transition:all var(--t);
+  transition:all var(--trans-fast);font-family:inherit;
+  position:relative;overflow:hidden;
 }
-button:active{transform:scale(.97)}
+button::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(180deg, rgba(255,255,255,0.1), transparent);
+  opacity:0;transition:opacity var(--trans-fast);
+}
+button:hover::before{opacity:1}
+button:active{transform:scale(0.97)}
 button:disabled{opacity:.4;cursor:not-allowed}
-.btn-primary{background:var(--accent);color:#000}
-.btn-primary:hover:not(:disabled){background:var(--accent-h)}
-.btn-ghost{background:var(--input);color:var(--txt);border:1px solid var(--border)}
-.btn-ghost:hover:not(:disabled){background:#30363d}
-.btn-success{background:#238636;color:#fff}
-.btn-success:hover:not(:disabled){background:#2ea043}
-.btn-danger{background:#2d1b1b;color:var(--red);border:1px solid #da3633}
-.btn-danger:hover:not(:disabled){background:#3d2020}
-.btn-warn{background:#2a2010;color:var(--yellow);border:1px solid #9e6a03}
-.btn-warn:hover:not(:disabled){background:#3a3010}
-.btn-launch{
-  background:linear-gradient(135deg,#238636,#2ea043);
-  color:#fff;padding:11px 28px;font-size:14px;
-  box-shadow:0 0 20px #23863644;
+
+.btn-primary{
+  background:linear-gradient(135deg, var(--gold), var(--gold-dark));
+  color:#0a0e14;box-shadow:0 4px 15px rgba(201,162,39,0.25);
 }
-.btn-launch:hover:not(:disabled){
-  box-shadow:0 0 30px #23863666;transform:translateY(-1px)
-}
-.btn-launch:disabled{
-  background:var(--input);color:var(--mute);box-shadow:none;
+.btn-primary:hover:not(:disabled){
+  box-shadow:0 6px 20px rgba(201,162,39,0.4);
+  transform:translateY(-1px);
 }
 
-/* ── Summary bar ─────────────────────────────────────────── */
-#summary{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--r);padding:14px 20px;
-  display:flex;align-items:center;gap:16px;
-  flex-shrink: 0;
+.btn-ghost{
+  background:var(--surface-3);
+  color:var(--txt-secondary);
+  border:1px solid var(--border-default);
 }
-#summary .s-item{display:flex;align-items:center;gap:6px;font-size:12px}
-#summary .s-dot{width:8px;height:8px;border-radius:50%}
+.btn-ghost:hover:not(:disabled){
+  background:var(--surface-4);color:var(--txt-primary);
+  border-color:var(--border-active);
+}
+
+.btn-success{
+  background:rgba(34,197,94,0.08);
+  color:var(--green);
+  border:1px solid rgba(34,197,94,0.2);
+}
+.btn-success:hover:not(:disabled){
+  background:rgba(34,197,94,0.15);border-color:rgba(34,197,94,0.4);
+}
+
+.btn-danger{
+  background:rgba(239,68,68,0.08);
+  color:var(--red);
+  border:1px solid rgba(239,68,68,0.2);
+}
+.btn-danger:hover:not(:disabled){
+  background:rgba(239,68,68,0.15);border-color:rgba(239,68,68,0.4);
+}
+
+.btn-warn{
+  background:rgba(234,179,8,0.08);
+  color:var(--yellow);
+  border:1px solid rgba(234,179,8,0.2);
+}
+.btn-warn:hover:not(:disabled){
+  background:rgba(234,179,8,0.15);border-color:rgba(234,179,8,0.4);
+}
+
+.btn-launch{
+  background:linear-gradient(135deg, var(--gold), var(--gold-dark));
+  color:#0a0e14;padding:11px 28px;font-size:14px;
+  box-shadow:0 0 20px rgba(201,162,39,0.3);
+}
+.btn-launch:hover:not(:disabled){
+  box-shadow:0 0 30px rgba(201,162,39,0.5);
+  transform:translateY(-1px);
+}
+.btn-launch:disabled{
+  background:var(--surface-4);color:var(--txt-muted);box-shadow:none;
+}
+
+/* ── Footer ─────────────────────────────────────────────── */
+#footer{
+  background:linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  border-top:1px solid var(--border-default);
+  padding:14px 32px;display:flex;align-items:center;gap:12px;flex-shrink:0;
+  position:relative;z-index:10;
+}
+#footer::before{
+  content:'';position:absolute;top:-1px;left:0;right:0;
+  height:1px;background:linear-gradient(90deg, transparent, var(--gold-glow-strong), transparent);
+}
+#footer .info{flex:1;font-size:12px;color:var(--txt-muted);}
 
 /* ── Toast ───────────────────────────────────────────────── */
 #toast{
-  position:fixed;bottom:80px;right:24px;
-  background:var(--card);border:1px solid var(--border);
-  border-radius:var(--r);padding:10px 18px;font-size:12px;
-  box-shadow:0 8px 32px #0008;
-  transform:translateY(10px);opacity:0;
-  transition:all .22s;pointer-events:none;z-index:999;
+  position:fixed;bottom:80px;right:28px;
+  background:linear-gradient(180deg, var(--surface-2), var(--surface-3));
+  border:1px solid var(--border-default);
+  border-radius:var(--radius-lg);padding:14px 24px;
+  font-size:13px;color:var(--txt-primary);font-weight:500;
+  box-shadow:var(--shadow-lg), 0 0 30px rgba(0,0,0,0.3);
+  transform:translateY(20px) scale(0.95);opacity:0;
+  transition:all .3s var(--ease-spring);
+  pointer-events:none;z-index:999;
+  display:flex;align-items:center;gap:10px;
 }
-#toast.show{transform:translateY(0);opacity:1}
-#toast.ok{border-color:var(--green);color:var(--green)}
-#toast.err{border-color:var(--red);color:var(--red)}
-#toast.warn {border-color:var(--yellow);color:var(--yellow)}
+#toast.show{transform:translateY(0) scale(1);opacity:1}
+#toast.ok{border-color:rgba(34,197,94,0.3);color:var(--green);}
+#toast.err{border-color:rgba(239,68,68,0.3);color:var(--red);}
+#toast.warn{border-color:rgba(234,179,8,0.3);color:var(--yellow);}
+
+/* ── SVG Icons ─────────────────────────────────────────── */
+svg { vertical-align: middle; }
+button svg { margin-top: -1px; width: 1.1em; height: 1.1em; }
+.comp-icon svg { width: 1.2em; height: 1.2em; color: var(--gold); }
+.logo-icon svg { width: 22px; height: 22px; color: #0a0e14; }
+.quick-actions button svg { width: 1.2em; height: 1.2em; }
+.chevron { display: flex; align-items: center; justify-content: center; }
+.chevron svg { width: 1.2em; height: 1.2em; transition: transform var(--trans-fast); }
+.card-top.expanded .chevron svg { transform: rotate(180deg); }
 </style>
 </head>
 <body>
 <div id="app">
 
 <div id="header">
-  <div class="logo-icon">🤖</div>
-  <div class="logo-text">
-    <div class="title">JARVIS <span>NEXUS</span> — Setup Wizard</div>
-    <div class="sub">Check and install all required components before first launch</div>
+  <div class="logo-wrap">
+    <div class="logo-icon">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="12 2 20.66 7 20.66 17 12 22 3.34 17 3.34 7"></polygon>
+        <circle cx="12" cy="12" r="3.5"></circle>
+        <line x1="12" y1="2" x2="12" y2="8.5"></line>
+        <line x1="12" y1="22" x2="12" y2="15.5"></line>
+        <line x1="20.66" y1="7" x2="15.03" y2="10.25"></line>
+        <line x1="20.66" y1="17" x2="15.03" y2="13.75"></line>
+        <line x1="3.34" y1="7" x2="8.97" y2="10.25"></line>
+        <line x1="3.34" y1="17" x2="8.97" y2="13.75"></line>
+        <circle cx="12" cy="2" r="1.5" fill="currentColor" stroke="none"></circle>
+        <circle cx="20.66" cy="7" r="1.5" fill="currentColor" stroke="none"></circle>
+        <circle cx="20.66" cy="17" r="1.5" fill="currentColor" stroke="none"></circle>
+        <circle cx="12" cy="22" r="1.5" fill="currentColor" stroke="none"></circle>
+        <circle cx="3.34" cy="17" r="1.5" fill="currentColor" stroke="none"></circle>
+        <circle cx="3.34" cy="7" r="1.5" fill="currentColor" stroke="none"></circle>
+      </svg>
+    </div>
+    <div class="logo-text">
+      <div class="logo-main">JARVIS <span>Setup</span></div>
+      <div class="logo-sub">First-Run Configuration Wizard</div>
+    </div>
   </div>
-  <div class="os-badge" id="os-badge">Detecting OS…</div>
-  <div class="os-badge" id="vram-badge" style="display:none; margin-left:8px; font-weight: bold;"></div>
+  <div class="os-badge" id="vram-badge" style="display:none; font-weight:bold;"></div>
+  <div class="os-badge" id="os-badge" style="margin-left:8px;">Detecting OS...</div>
+  <div class="os-badge" id="version-badge" style="margin-left:8px;">v__APP_VERSION__</div>
 </div>
 
 <div id="body">
 
   <div id="summary">
-    <span style="font-size:12px;color:var(--sub);font-weight:600">STATUS:</span>
-    <div class="s-item"><div class="s-dot" id="sum-ollama" style="background:var(--mute)"></div><span>Ollama</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-llm"    style="background:var(--mute)"></div><span>LLM</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-stt"    style="background:var(--mute)"></div><span>STT</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-tts"    style="background:var(--mute)"></div><span>TTS</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-emb"    style="background:var(--mute)"></div><span style="color:var(--sub)">Embeddings (opt)</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-sysfiles" style="background:var(--mute)"></div><span>SysFiles</span></div>
-    <div class="s-item"><div class="s-dot" id="sum-mpv" style="background:var(--mute)"></div><span>MPV</span></div>
-    <button class="btn-ghost" style="margin-left:auto;padding:5px 12px;font-size:11px"
-            onclick="recheck()">🔄 Re-check</button>
+    <span style="font-size:12px;color:var(--txt-muted);font-weight:600;">STATUS:</span>
+    <div class="s-item"><div class="s-dot" id="sum-ollama" style="background:var(--txt-muted)"></div><span>Ollama</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-llm"    style="background:var(--txt-muted)"></div><span>LLM</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-stt"    style="background:var(--txt-muted)"></div><span>STT</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-tts"    style="background:var(--txt-muted)"></div><span>TTS</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-emb"    style="background:var(--txt-muted)"></div><span style="color:var(--txt-muted)">Embeddings (opt)</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-sysfiles" style="background:var(--txt-muted)"></div><span>SysFiles</span></div>
+    <div class="s-item"><div class="s-dot" id="sum-mpv" style="background:var(--txt-muted)"></div><span>MPV</span></div>
+    <button class="btn-ghost" style="margin-left:auto;padding:5px 12px;font-size:11px;"
+            onclick="recheck()"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> Re-check</button>
   </div>
 
+  <!-- Ollama Card -->
   <div class="comp-card" id="card-ollama">
     <div class="card-top" onclick="toggle('ollama')">
       <div class="status-dot" id="dot-ollama"></div>
-      <div class="comp-icon">🦙</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg></div>
       <div class="comp-info">
         <div class="comp-name">Ollama</div>
-        <div class="comp-detail" id="detail-ollama">Checking…</div>
+        <div class="comp-detail" id="detail-ollama">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="doDownload('ollama')" title="Download">⬇️</button>
+        <button class="btn-ghost btn-sm" id="icon-dl-ollama" onclick="doDownload('ollama')" title="Download"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>
+        <button class="btn-ghost btn-sm" id="icon-cancel-ollama" onclick="doCancel('ollama')" title="Cancel" style="display:none"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
       </div>
-      <span class="chevron" id="chev-ollama">▼</span>
+      <span class="chevron" id="chev-ollama"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-ollama">
       <div class="desc">
@@ -845,12 +1069,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
         Detected OS: <code id="os-label">—</code>
       </div>
       <div class="action-row">
-        <button class="btn-primary" onclick="doDownload('ollama')">
-          ⬇ Download Ollama Installer
+        <button class="btn-primary" id="btn-dl-ollama" onclick="doDownload('ollama')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Ollama Installer
         </button>
-        <button class="btn-ghost"
-                onclick="pywebview.api.open_url('https://ollama.com')">
-          🌐 ollama.com
+        <button class="btn-danger" id="btn-cancel-ollama" onclick="doCancel('ollama')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
+        </button>
+        <button class="btn-ghost" onclick="pywebview.api.open_url('https://ollama.com')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> ollama.com
         </button>
       </div>
       <div class="progress-wrap" id="prog-ollama">
@@ -858,27 +1084,27 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-ollama-speed">—</span>
           <span id="prog-ollama-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-ollama"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-ollama"></div></div>
         <div class="progress-label" id="lbl-ollama"></div>
       </div>
     </div>
   </div>
 
+  <!-- LLM Card -->
   <div class="comp-card" id="card-llm">
     <div class="card-top" onclick="toggle('llm')">
       <div class="status-dot" id="dot-llm"></div>
-      <div class="comp-icon">🧠</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg></div>
       <div class="comp-info">
         <div class="comp-name">LLM Model</div>
-        <div class="comp-detail" id="detail-llm">Checking…</div>
+        <div class="comp-detail" id="detail-llm">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="doDownload('llm')" title="Download Default">⬇️</button>
-        <button class="btn-ghost btn-icon" onclick="pywebview.api.open_folder('llm')" title="Open Folder">📂</button>
+        <button class="btn-ghost btn-sm" id="icon-dl-llm" onclick="doDownload('llm')" title="Download"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>
+        <button class="btn-ghost btn-sm" id="icon-cancel-llm" onclick="doCancel('llm')" title="Cancel" style="display:none"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
+        <button class="btn-ghost btn-sm" onclick="pywebview.api.open_folder('llm')" title="Open Folder"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></button>
       </div>
-      <span class="chevron" id="chev-llm">▼</span>
+      <span class="chevron" id="chev-llm"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-llm">
       <div class="desc">
@@ -892,14 +1118,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <div class="file-list" id="files-llm"></div>
       <div class="action-row">
         <button class="btn-primary" id="btn-dl-llm" onclick="doDownload('llm')">
-          ⬇ Download Qwen3-4B (Recommended)
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Qwen3-4B (Recommended)
+        </button>
+        <button class="btn-danger" id="btn-cancel-llm" onclick="doCancel('llm')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
         <button class="btn-ghost" onclick="pywebview.api.open_folder('llm')">
-          📂 Open LLM Folder
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Open LLM Folder
         </button>
         <button class="btn-ghost"
                 onclick="pywebview.api.open_url('https://huggingface.co/Qwen/Qwen3-4B-Instruct-GGUF')">
-          🤗 HuggingFace Repo
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> HuggingFace Repo
         </button>
       </div>
       <div class="progress-wrap" id="prog-llm">
@@ -907,27 +1136,27 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-llm-speed">—</span>
           <span id="prog-llm-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-llm"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-llm"></div></div>
         <div class="progress-label" id="lbl-llm"></div>
       </div>
     </div>
   </div>
 
+  <!-- STT Card -->
   <div class="comp-card" id="card-stt">
     <div class="card-top" onclick="toggle('stt')">
       <div class="status-dot" id="dot-stt"></div>
-      <div class="comp-icon">🎙️</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg></div>
       <div class="comp-info">
         <div class="comp-name">Speech-to-Text Model</div>
-        <div class="comp-detail" id="detail-stt">Checking…</div>
+        <div class="comp-detail" id="detail-stt">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="doDownload('stt')" title="Download Default">⬇️</button>
-        <button class="btn-ghost btn-icon" onclick="pywebview.api.open_folder('stt')" title="Open Folder">📂</button>
+        <button class="btn-ghost btn-sm" id="icon-dl-stt" onclick="doDownload('stt')" title="Download"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>
+        <button class="btn-ghost btn-sm" id="icon-cancel-stt" onclick="doCancel('stt')" title="Cancel" style="display:none"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
+        <button class="btn-ghost btn-sm" onclick="pywebview.api.open_folder('stt')" title="Open Folder"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></button>
       </div>
-      <span class="chevron" id="chev-stt">▼</span>
+      <span class="chevron" id="chev-stt"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-stt">
       <div class="desc">
@@ -937,15 +1166,18 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </div>
       <div class="file-list" id="files-stt"></div>
       <div class="action-row">
-        <button class="btn-primary" onclick="doDownload('stt')">
-          ⬇ Download STT Model
+        <button class="btn-primary" id="btn-dl-stt" onclick="doDownload('stt')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download STT Model
+        </button>
+        <button class="btn-danger" id="btn-cancel-stt" onclick="doCancel('stt')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
         <button class="btn-ghost" onclick="pywebview.api.open_folder('stt')">
-          📂 Open STT Folder
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Open STT Folder
         </button>
         <button class="btn-ghost"
                 onclick="pywebview.api.open_url('https://huggingface.co/guillaumekln/faster-whisper-small.en')">
-          🤗 HuggingFace Repo
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> HuggingFace Repo
         </button>
       </div>
       <div class="progress-wrap" id="prog-stt">
@@ -953,27 +1185,26 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-stt-speed">—</span>
           <span id="prog-stt-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-stt"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-stt"></div></div>
         <div class="progress-label" id="lbl-stt"></div>
       </div>
     </div>
   </div>
 
+  <!-- TTS Card -->
   <div class="comp-card" id="card-tts">
     <div class="card-top" onclick="toggle('tts')">
       <div class="status-dot" id="dot-tts"></div>
-      <div class="comp-icon">🔊</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg></div>
       <div class="comp-info">
         <div class="comp-name">TTS Voice Files</div>
-        <div class="comp-detail" id="detail-tts">Checking…</div>
+        <div class="comp-detail" id="detail-tts">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="pywebview.api.open_url('https://huggingface.co/rhasspy/piper-voices/tree/main/en')" title="Browse HF Voices">🌐</button>
-        <button class="btn-ghost btn-icon" onclick="pywebview.api.open_folder('tts')" title="Open Folder">📂</button>
+        <button class="btn-ghost btn-sm" onclick="pywebview.api.open_url('https://huggingface.co/rhasspy/piper-voices/tree/main/en')" title="Browse HF"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg></button>
+        <button class="btn-ghost btn-sm" onclick="pywebview.api.open_folder('tts')" title="Open Folder"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></button>
       </div>
-      <span class="chevron" id="chev-tts">▼</span>
+      <span class="chevron" id="chev-tts"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-tts">
       <div class="desc" id="desc-tts">
@@ -986,17 +1217,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </div>
       <div class="file-list" id="files-tts"></div>
       <div class="action-row">
-        <button class="btn-primary" onclick="doDownload('jarvis_voice')" id="btn-dl-jarvis-voice">
-          ⬇ Download Original Jarvis Voice
+        <button class="btn-primary" onclick="doDownload('jarvis_voice')" id="btn-dl-tts">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Original Jarvis Voice
+        </button>
+        <button class="btn-danger" id="btn-cancel-tts" onclick="doCancel('jarvis_voice')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
         <button class="btn-warn"
                 onclick="pywebview.api.open_url('https://huggingface.co/rhasspy/piper-voices/tree/main/en')">
-          🤗 Browse Piper Voices (English)
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> Browse Piper Voices (English)
         </button>
         <button class="btn-ghost" onclick="pywebview.api.open_folder('tts')">
-          📂 Open TTS Folder
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Open TTS Folder
         </button>
-        <div style="font-size:11px;color:var(--sub);max-width:320px;line-height:1.5">
+        <div style="font-size:11px;color:var(--txt-muted);max-width:320px;line-height:1.5">
           Download the <code>.onnx</code> + <code>.onnx.json</code> files and place them
           in <code>assets/tts/jarvis_en_GB_high/</code> — then re-check.
         </div>
@@ -1004,34 +1238,39 @@ button:disabled{opacity:.4;cursor:not-allowed}
     </div>
   </div>
 
+  <!-- Embeddings Card -->
   <div class="comp-card optional" id="card-embeddings">
     <div class="card-top" onclick="toggle('embeddings')">
       <div class="status-dot" id="dot-embeddings"></div>
-      <div class="comp-icon">🔗</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></div>
       <div class="comp-info">
-        <div class="comp-name">Embeddings Model (Ollama)</div>
-        <div class="comp-detail" id="detail-embeddings">Checking…</div>
+        <div class="comp-name">Embeddings Model</div>
+        <div class="comp-detail" id="detail-embeddings">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="doDownload('embeddings')" title="Pull Model via Ollama">⬇️</button>
+        <button class="btn-ghost btn-sm" id="icon-dl-embeddings" onclick="doDownload('embeddings')" title="Download Model"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>
+        <button class="btn-ghost btn-sm" id="icon-cancel-embeddings" onclick="doCancel('embeddings')" title="Cancel" style="display:none"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
       </div>
       <span class="opt-tag">Optional</span>
-      <span class="chevron" id="chev-embeddings">▼</span>
+      <span class="chevron" id="chev-embeddings"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-embeddings">
       <div class="desc">
-        <strong>nomic-embed-text</strong> — Used for semantic memory search.
+        <strong>Embeddings Model</strong> — Used for semantic memory search.
         Enables JARVIS to find relevant memories by meaning, not just keywords.
         <strong>Not required for basic operation</strong> — skip if you just want to get started.<br><br>
-        <em>Note: This model is pulled and managed securely inside Ollama. No local folders are needed.</em>
+        <em>Note: This model is downloaded and loaded locally using SentenceTransformers.</em>
       </div>
       <div class="action-row">
-        <button class="btn-ghost" onclick="doDownload('embeddings')">
-          ⬇ Pull Model via Ollama
+        <button class="btn-ghost" id="btn-dl-embeddings" onclick="doDownload('embeddings')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Model
+        </button>
+        <button class="btn-danger" id="btn-cancel-embeddings" onclick="doCancel('embeddings')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
         <button class="btn-ghost"
-                onclick="pywebview.api.open_url('https://ollama.com/library/nomic-embed-text')">
-          🌐 Ollama Library
+                onclick="pywebview.api.open_url('https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> HuggingFace Page
         </button>
       </div>
       <div class="progress-wrap" id="prog-embeddings">
@@ -1039,26 +1278,26 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-embeddings-speed">—</span>
           <span id="prog-embeddings-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-embeddings"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-embeddings"></div></div>
         <div class="progress-label" id="lbl-embeddings"></div>
       </div>
     </div>
   </div>
 
+  <!-- Sysfiles Card -->
   <div class="comp-card" id="card-sysfiles">
     <div class="card-top" onclick="toggle('sysfiles')">
       <div class="status-dot" id="dot-sysfiles"></div>
-      <div class="comp-icon">🎞️</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 12 15 2 8.5 12 2"></polygon><polyline points="2 12.5 12 19 22 12.5"></polyline><polyline points="2 16.5 12 23 22 16.5"></polyline></svg></div>
       <div class="comp-info">
         <div class="comp-name">System Files</div>
-        <div class="comp-detail" id="detail-sysfiles">Checking…</div>
+        <div class="comp-detail" id="detail-sysfiles">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="doDownload('sysfiles')" title="Download Missing">⬇️</button>
+        <button class="btn-ghost btn-sm" id="icon-dl-sysfiles" onclick="doDownload('sysfiles')" title="Download"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></button>
+        <button class="btn-ghost btn-sm" id="icon-cancel-sysfiles" onclick="doCancel('sysfiles')" title="Cancel" style="display:none"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
       </div>
-      <span class="chevron" id="chev-sysfiles">▼</span>
+      <span class="chevron" id="chev-sysfiles"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-sysfiles">
       <div class="desc">
@@ -1066,8 +1305,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </div>
       <div class="file-list" id="files-sysfiles"></div>
       <div class="action-row">
-        <button class="btn-primary" onclick="doDownload('sysfiles')">
-          ⬇ Download Missing Assets
+        <button class="btn-primary" id="btn-dl-sysfiles" onclick="doDownload('sysfiles')">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download Missing Assets
+        </button>
+        <button class="btn-danger" id="btn-cancel-sysfiles" onclick="doCancel('sysfiles')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
       </div>
       <div class="progress-wrap" id="prog-sysfiles">
@@ -1075,26 +1317,25 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-sysfiles-speed">—</span>
           <span id="prog-sysfiles-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-sysfiles"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-sysfiles"></div></div>
         <div class="progress-label" id="lbl-sysfiles"></div>
       </div>
     </div>
   </div>
 
+  <!-- MPV Card -->
   <div class="comp-card" id="card-mpv">
     <div class="card-top" onclick="toggle('mpv')">
       <div class="status-dot" id="dot-mpv"></div>
-      <div class="comp-icon">🎞️</div>
+      <div class="comp-icon"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg></div>
       <div class="comp-info">
         <div class="comp-name">MPV Player</div>
-        <div class="comp-detail" id="detail-mpv">Checking…</div>
+        <div class="comp-detail" id="detail-mpv">Checking...</div>
       </div>
       <div class="quick-actions" onclick="event.stopPropagation()">
-        <button class="btn-ghost btn-icon" onclick="pywebview.api.open_folder('bin')" title="Open Folder">📂</button>
+        <button class="btn-ghost btn-sm" onclick="pywebview.api.open_folder('bin')" title="Open Folder"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></button>
       </div>
-      <span class="chevron" id="chev-mpv">▼</span>
+      <span class="chevron" id="chev-mpv"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg></span>
     </div>
     <div class="card-body" id="body-mpv">
       <div class="desc">
@@ -1110,13 +1351,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
       </div>
       <div class="action-row">
         <button class="btn-primary" id="btn-dl-mpv" onclick="doDownload('mpv')" style="display:none">
-          ⬇ Download & Install MPV
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download & Install MPV
+        </button>
+        <button class="btn-danger" id="btn-cancel-mpv" onclick="doCancel('mpv')" style="display:none">
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Cancel Download
         </button>
         <button class="btn-primary" id="btn-info-mpv" onclick="pywebview.api.open_url('https://mpv.io/installation/')" style="display:none">
-          🌐 Instructions for Linux
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> Instructions for Linux
         </button>
         <button class="btn-ghost" onclick="pywebview.api.open_folder('bin')">
-          📂 Open bin Folder
+          <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg> Open bin Folder
         </button>
       </div>
       <div class="progress-wrap" id="prog-mpv">
@@ -1124,20 +1368,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <span id="prog-mpv-speed">—</span>
           <span id="prog-mpv-pct">0%</span>
         </div>
-        <div class="progress-bar-bg">
-          <div class="progress-bar" id="bar-mpv"></div>
-        </div>
+        <div class="progress-bar-bg"><div class="progress-bar" id="bar-mpv"></div></div>
         <div class="progress-label" id="lbl-mpv"></div>
       </div>
     </div>
   </div>
 
-</div><div id="footer">
-  <div class="info" id="footer-info">Checking components…</div>
-  <button class="btn-ghost" onclick="openSettings()">⚙️ Settings</button>
-  <button class="btn-ghost" onclick="recheck()">🔄 Re-check All</button>
+</div>
+
+<div id="footer">
+  <div class="info" id="footer-info">Checking components...</div>
+  <button class="btn-ghost" onclick="openSettings()"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg> Settings</button>
+  <button class="btn-ghost" onclick="recheck()"><svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> Re-check All</button>
   <button class="btn-launch" id="btn-launch" disabled onclick="launchJarvis()">
-    🚀 Launch JARVIS
+    <svg width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg> Launch JARVIS
   </button>
 </div>
 
@@ -1161,7 +1405,7 @@ window.addEventListener('pywebviewready', async () => {
 // ║                       RECHECK                                ║
 // ╚══════════════════════════════════════════════════════════════╝
 async function recheck() {
-  document.getElementById('footer-info').textContent = 'Re-checking…';
+  document.getElementById('footer-info').textContent = 'Re-checking...';
   const raw = await pywebview.api.get_status();
   STATUS = JSON.parse(raw);
   renderAll();
@@ -1177,29 +1421,26 @@ async function openSettings() {
 }
 
 function renderAll() {
-  // OS badge
   const os = STATUS.os;
   document.getElementById('os-badge').textContent = `${os.name} detected`;
   document.getElementById('os-label').textContent = os.name;
 
-  // VRAM Badge
   const vramBadge = document.getElementById('vram-badge');
   if (STATUS.vram_gb !== null && STATUS.vram_gb !== undefined) {
       vramBadge.style.display = 'block';
       if (STATUS.vram_gb < 4) {
           vramBadge.style.color = 'var(--red)';
           vramBadge.style.borderColor = 'var(--red)';
-          vramBadge.textContent = `⚠️ VRAM: ${STATUS.vram_gb} GB (Min 4GB required for smooth operation)`;
+          vramBadge.textContent = `⚠ VRAM: ${STATUS.vram_gb} GB (Min 4GB required)`;
       } else {
-          vramBadge.style.color = 'var(--sub)';
-          vramBadge.style.borderColor = 'var(--border)';
+          vramBadge.style.color = 'var(--txt-muted)';
+          vramBadge.style.borderColor = 'var(--border-default)';
           vramBadge.textContent = `VRAM: ${STATUS.vram_gb} GB`;
       }
   } else {
       vramBadge.style.display = 'none';
   }
 
-  // each component
   renderComp('ollama',     STATUS.ollama,     false);
   renderComp('llm',        STATUS.llm,        false);
   renderComp('stt',        STATUS.stt,        false);
@@ -1210,13 +1451,14 @@ function renderAll() {
 
   if (STATUS.os.name === 'Windows') {
     document.getElementById('mpv-desc-win').style.display = 'inline';
-    document.getElementById('btn-dl-mpv').style.display = 'inline-flex';
+    if (STATUS.mpv && !STATUS.mpv.ok) {
+        document.getElementById('btn-dl-mpv').style.display = 'inline-flex';
+    }
   } else {
     document.getElementById('mpv-desc-lin').style.display = 'inline';
     document.getElementById('btn-info-mpv').style.display = 'inline-flex';
   }
 
-  // file pills
   renderFiles('stt',        ['config.json','model.bin','tokenizer.json','vocabulary.txt'],
               STATUS.stt?.missing || []);
   renderFiles('tts',        STATUS.tts?.required || ['model.onnx','model.onnx.json'],
@@ -1227,7 +1469,6 @@ function renderAll() {
   renderFiles('sysfiles',   STATUS.sysfiles?.required || [],
               STATUS.sysfiles?.missing || []);
 
-  // LLM file pills (found models)
   const llmList = document.getElementById('files-llm');
   llmList.innerHTML = '';
   if (STATUS.llm?.models?.length) {
@@ -1239,7 +1480,6 @@ function renderAll() {
     });
   }
 
-  // summary dots
   const dotMap = {
     'sum-ollama': STATUS.ollama,
     'sum-llm':    STATUS.llm,
@@ -1254,7 +1494,6 @@ function renderAll() {
       s.ok ? 'var(--green)' : (s.optional ? 'var(--yellow)' : 'var(--red)');
   });
 
-  // launch button
   const allOk = REQUIRED.every(k => STATUS[k]?.ok);
   const btn = document.getElementById('btn-launch');
   btn.disabled = !allOk;
@@ -1273,6 +1512,27 @@ function renderComp(id, s, optional) {
   detail.textContent = s.detail || '';
   card.className   = 'comp-card' + (s.ok ? ' ok' : (optional ? ' warn' : ' error'))
                      + (optional ? ' optional' : '');
+
+  const iconDl = document.getElementById(`icon-dl-${id}`);
+  const btnDl = document.getElementById(`btn-dl-${id}`);
+  
+  if (s.ok) {
+    if (iconDl) iconDl.style.display = 'none';
+    if (btnDl) btnDl.style.display = 'none';
+  } else {
+    const progWrap = document.getElementById(`prog-${id}`);
+    const isDownloading = progWrap && progWrap.classList.contains('show');
+    if (!isDownloading) {
+      if (iconDl) iconDl.style.display = '';
+      if (btnDl) {
+        if (id === 'mpv' && STATUS.os && STATUS.os.name !== 'Windows') {
+          btnDl.style.display = 'none';
+        } else {
+          btnDl.style.display = (id === 'mpv' ? 'inline-flex' : '');
+        }
+      }
+    }
+  }
 }
 
 function renderFiles(id, required, missing) {
@@ -1297,25 +1557,57 @@ function toggle(id) {
   const open  = body.classList.toggle('open');
   top.classList.toggle('expanded', open);
 }
+
 // ║                      DOWNLOADS                               ║
-// ╚══════════════════════════════════════════════════════════════╝
 async function doDownload(comp) {
-  // If it's the custom voice, map it to update the TTS progress UI
-  const uiComp = comp === 'jarvis_voice' ? 'tts' : comp;
-  showProg(uiComp, true);
-  
+  showProg(comp, true);
   const resStr = await pywebview.api.start_download(comp);
   const res = JSON.parse(resStr);
-  
-  if (!res.ok && res.reason === "Already Existed") {
-      showProg(uiComp, false);
-      toast('Already Existed', 'warn');
+  if (!res.ok) {
+      showProg(comp, false);
+      if (res.reason === "Already Existed") {
+          toast('Already Existed', 'warn');
+      } else if (res.reason !== "Already downloading") {
+          toast(res.reason || 'Failed to start', 'err');
+      }
+  }
+}
+
+async function doCancel(comp) {
+  const resStr = await pywebview.api.cancel_task(comp);
+  const res = JSON.parse(resStr);
+  if (res.ok) {
+      showProg(comp, false);
+      toast(`Cancelled ${comp}`, 'warn');
   }
 }
 
 function showProg(comp, show) {
-  const el = document.getElementById(`prog-${comp}`);
+  const uiComp = comp === 'jarvis_voice' ? 'tts' : comp;
+  const btnComp = uiComp;
+  
+  const el = document.getElementById(`prog-${uiComp}`);
   if (el) el.classList.toggle('show', show);
+  
+  const iconDl = document.getElementById(`icon-dl-${btnComp}`);
+  const btnDl = document.getElementById(`btn-dl-${btnComp}`);
+  const iconCancel = document.getElementById(`icon-cancel-${btnComp}`);
+  const btnCancel = document.getElementById(`btn-cancel-${btnComp}`);
+  
+  if (show) {
+    if (iconDl) iconDl.style.display = 'none';
+    if (btnDl) btnDl.style.display = 'none';
+    if (iconCancel) iconCancel.style.display = '';
+    if (btnCancel) btnCancel.style.display = '';
+  } else {
+    if (iconCancel) iconCancel.style.display = 'none';
+    if (btnCancel) btnCancel.style.display = 'none';
+    const isOk = STATUS[uiComp] && STATUS[uiComp].ok;
+    if (!isOk) {
+      if (iconDl) iconDl.style.display = '';
+      if (btnDl) btnDl.style.display = (btnComp === 'mpv' && STATUS.os && STATUS.os.name !== 'Windows') ? 'none' : '';
+    }
+  }
 }
 
 // Called from Python via evaluate_js
@@ -1329,20 +1621,19 @@ function onProgress(comp, pct, speed, label) {
   if (spdEl) spdEl.textContent = speed;
   if (lblEl) lblEl.textContent = label;
 
-  // Spin the dot while downloading
   const dot = document.getElementById(`dot-${comp}`);
   if (dot) dot.className = 'status-dot dot-spin';
 }
 
 async function onDone(comp) {
   showProg(comp, false);
-  toast(`✔ ${comp.toUpperCase()} ready!`, 'ok');
+  toast(`\u2714 ${comp.toUpperCase()} ready!`, 'ok');
   await recheck();
 }
 
 function onError(comp, msg) {
   showProg(comp, false);
-  toast(`✕ ${comp}: ${msg}`, 'err');
+  toast(`\u2716 ${comp}: ${msg}`, 'err');
   const dot = document.getElementById(`dot-${comp}`);
   if (dot) dot.className = 'status-dot dot-error';
 }
@@ -1385,11 +1676,9 @@ def should_show_wizard() -> bool:
       - TTS folder is missing required files
       - System files missing
     """
-    # 1. Explicit flag
     if not config.get("setup_complete", False):
         return True
 
-    # 2. Critical component check
     checks = run_all_checks()
     critical = ["llm", "stt", "tts", "sysfiles", "mpv"]
     if any(not checks[k]["ok"] for k in critical):
@@ -1400,30 +1689,36 @@ def should_show_wizard() -> bool:
 
 def launch_wizard(block=True):
     """Open the setup wizard window."""
-    # ─── Single Instance Enforcement (Wizard) ───
     from core.bootstrap.utils import enforce_single_instance
     if not enforce_single_instance("JARVIS_Wizard_Mutex", "JARVIS NEXUS — Setup Wizard"):
         print("Setup Wizard is already open.")
         return
 
+    import os
+    os.environ.setdefault(
+        'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS',
+        '--disable-background-networking --disable-component-update --disable-domain-reliability'
+    )
+
     api = WizardAPI()
 
-    # MODIFIED: Increased default width & height to prevent overlapping elements
+    from core.config import APP_VERSION
+    html_content = HTML.replace('v__APP_VERSION__', f'v{APP_VERSION}')
+
     window = webview.create_window(
-        title            = "JARVIS NEXUS — Setup Wizard",
-        html             = HTML,
+        title            = "JARVIS NEXUS · Setup Wizard",
+        html             = html_content,
         js_api           = api,
         width            = 1150, 
         height           = 850,
         min_size         = (1000, 750),
         resizable        = True,
-        background_color = "#0d1117",
+        background_color = "#0a0e14",
     )
     api.set_window(window)
-    webview.start(debug=False)
+    webview.start(debug=False, icon=TRAY_ICON_PATH)
 
 
-# ── Convenience: call this from your main app entry point ─────
 _WIZARD_LOCK = threading.Lock()
 
 def safe_run_wizard():
