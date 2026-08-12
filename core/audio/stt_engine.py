@@ -180,6 +180,12 @@ class Ears:
                             
                             # 3. Gatekeeper Check
                             if intended_for_queue and self.route_to_queue:
+                                # MODIFIED: Drop oldest stale chunk if queue is backing up (> 3 chunks = ~4.5s lag)
+                                if self.audio_queue.qsize() >= 3:
+                                    try:
+                                        self.audio_queue.get_nowait()
+                                    except queue.Empty:
+                                        pass
                                 self.audio_queue.put(audio_data)
                                 
                             if intended_for_bg and self.is_listening and self.interrupt_callback:
@@ -360,7 +366,9 @@ class Ears:
             if not mouth_instance.is_busy() or interrupted:
                 return
             
-            if not transcribe_lock.acquire(blocking=False):
+            # MODIFIED: Wait up to 400ms for the lock instead of discarding immediately (blocking=False)
+            # Prevents valid interruption commands from being dropped when STT is momentarily busy
+            if not transcribe_lock.acquire(timeout=0.4):
                 return
                 
             try:

@@ -371,6 +371,9 @@ class Mouth:
         
         if pygame.mixer.get_init():
             pygame.mixer.music.stop()
+
+        # MODIFIED: CRITICAL — Release any thread waiting on speech_done_event immediately on abortion
+        self.speech_done_event.set()
     
     def get_interruption_context(self) -> dict:
         """Returns the speech position at the time of the last interruption."""
@@ -483,11 +486,10 @@ class Mouth:
     def _play_worker(self):
         while True:
             try:
-                # Genius tweak: Use timeout to create a natural silence window (1 sec)
-                # Prevents deadlocks and allows natural breathing room after speech
-                task = self.playback_queue.get(timeout=1)
+                # MODIFIED: 100ms timeout (down from 1000ms) for zero-latency mic/system release
+                task = self.playback_queue.get(timeout=0.1)
             except queue.Empty:
-                # If queue is empty and no new audio arrives within 1 sec, and no synthesis is ongoing:
+                # If queue is empty and no new audio arrives within 0.1s, and no synthesis is ongoing:
                 if self.speech_queue.empty() and not self.is_synthesizing:
                     self.is_speaking = False
                     self.speech_done_event.set()
@@ -529,5 +531,10 @@ class Mouth:
             # Cap spoken_history to prevent unbounded RAM growth over 24/7 uptime
             if len(self.spoken_history) > 20:
                 self.spoken_history = self.spoken_history[-20:]
+
+            # MODIFIED: Zero-latency release — if this was the last chunk, signal done immediately
+            if self.playback_queue.empty() and self.speech_queue.empty() and not self.is_synthesizing:
+                self.is_speaking = False
+                self.speech_done_event.set()
             
             self.playback_queue.task_done()

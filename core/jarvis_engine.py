@@ -36,7 +36,7 @@ from core.llm_client import LLMClient  # Transport & I/O layer
 
 # --- Decoupled Modules ---
 from core.ui.video_player import VideoPlayer
-from core.tools.default_tools import register_all_tools, SILENT_TOOLS, FREE_TOOLS
+from core.tools.default_tools import register_all_tools
 
 # =================================================================
 # Interrupt State Machine
@@ -59,12 +59,12 @@ class InterruptState:
 # =================================================================
 class StateManager:
     """
-    Runtime state container (lives only while the program runs).
-    Manages language mode, listening flags, temp memory, user location,
-    and the formal interrupt state machine.
+    Runtime state container with thread-safe transitions.
+    v1.3: All state mutations protected by RLock.
     """
 
     def __init__(self):
+        self._lock = threading.RLock()
         self.always_listening  = False
         self.overthinking_mode = False
         self.root_mode         = False   # Bypasses all permission checks when True
@@ -79,7 +79,7 @@ class StateManager:
         self.last_file_path = ""
 
         # Formal Interrupt State Machine
-        self.interrupt_state = InterruptState.IDLE
+        self._interrupt_state = InterruptState.IDLE
         self.interrupted_position = ""      # Last spoken text before mid-speech interrupt
         self.interrupted_context = {}       # Preserved context for optional resume
         self.pending_resume_data = None     # Stored interrupted task data if user wants to continue
@@ -94,6 +94,16 @@ class StateManager:
         self._cached_persona = None
         self._cached_overthinking = None
         self._static_system_content = None
+
+    @property
+    def interrupt_state(self) -> str:
+        with self._lock:
+            return self._interrupt_state
+
+    @interrupt_state.setter
+    def interrupt_state(self, value: str):
+        with self._lock:
+            self._interrupt_state = value
 
     def _fetch_location(self) -> str:
         """DB first, then optional IP-API fallback."""
@@ -118,68 +128,88 @@ class StateManager:
             print("🔒 External location API blocked by privacy settings.")
 
         return (
-            "Unknown (Location auto-detection is off. If you need the user's location for "
-            "weather or local queries, politely ask them for it. NOTE: Your internet, "
-            "browsing, and YouTube tools are STILL FULLY ACTIVE and functional)."
+            "Unknown (Location auto-detection is off. If the user asks for weather or local queries, "
+            "use 'search_web' with their specified city, or politely ask for their city if omitted. "
+            "NOTE: Your internet, browsing, and YouTube tools are STILL FULLY ACTIVE and functional)."
         )
     
     def grant_permission(self, action: str, minutes: int = 10):
-        self.active_permissions[action.lower().strip()] = time.time() + (minutes * 60)
+        with self._lock:
+            self.active_permissions[action.lower().strip()] = time.time() + (minutes * 60)
         print(f"🔑 [Security] Permission granted for '{action}' ({minutes}m).")
 
     def get_permissions_context(self) -> str:
-        current_time = time.time()
-        expired = [k for k, v in self.active_permissions.items() if current_time > v]
-        for k in expired:
-            del self.active_permissions[k]
-            print(f"🔒 [Security] Permission expired for '{k}'.")
+        with self._lock:
+            current_time = time.time()
+            expired = [k for k, v in self.active_permissions.items() if current_time > v]
+            for k in expired:
+                del self.active_permissions[k]
+                print(f"🔒 [Security] Permission expired for '{k}'.")
+                
+            if not self.active_permissions:
+                return ""
             
-        if not self.active_permissions:
-            return ""
-        
-        valid = list(self.active_permissions.keys())
-        return "ACTIVE PERMISSIONS: " + ", ".join(valid)
+            valid = list(self.active_permissions.keys())
+            return "ACTIVE PERMISSIONS: " + ", ".join(valid)
+
+    def has_permission(self, action: str) -> bool:
+        """O(1) permission check."""
+        with self._lock:
+            action = action.lower().strip()
+            expiry = self.active_permissions.get(action, 0)
+            if time.time() < expiry:
+                return True
+            if expiry > 0:
+                del self.active_permissions[action]
+            return False
 
     def set_always_listening(self, enabled: bool):
-        self.always_listening = enabled
+        with self._lock:
+            self.always_listening = enabled
         print(f"👂 Always Listening: {'ON' if enabled else 'OFF'}")
 
     def add_temp_memory(self, item: str):
-        self.temp_memory.append(item)
+        with self._lock:
+            self.temp_memory.append(item)
         print(f"💾 Temp Memory: {item}")
 
     def clear_temp_memory(self):
-        self.temp_memory = []
+        with self._lock:
+            self.temp_memory = []
         print("🗑️ Temp Memory cleared")
 
     def get_temp_memory_context(self) -> str:
-        if not self.temp_memory:
-            return ""
-        return "Temporary Context:\n" + "\n".join(self.temp_memory)
+        with self._lock:
+            if not self.temp_memory:
+                return ""
+            return "Temporary Context:\n" + "\n".join(self.temp_memory)
 
     # ------------------------------------------------------------------
     # Interrupt State Machine Transitions
     # ------------------------------------------------------------------
     def transition_to(self, new_state: str):
         """Formal state transition with logging."""
-        old = self.interrupt_state
-        self.interrupt_state = new_state
+        with self._lock:
+            old = self._interrupt_state
+            self._interrupt_state = new_state
         if old != new_state:
             print(f"\n   🔄 [State] {old} → {new_state}")
 
     def handle_thinking_interrupt(self):
         """State 1: Abort during LLM generation. Clears all pending context."""
-        self.transition_to(InterruptState.INTERRUPTED_THINKING)
-        self.interrupted_context = {}
-        self.pending_resume_data = None
+        with self._lock:
+            self._interrupt_state = InterruptState.INTERRUPTED_THINKING
+            self.interrupted_context = {}
+            self.pending_resume_data = None
         print("   ⚡ [Interrupt] Thinking aborted — entering follow-up window")
         self.transition_to(InterruptState.FOLLOW_UP)
 
     def handle_speech_interrupt(self, position_text: str, context: dict = None):
         """State 2: Abort during TTS output. Preserves interrupted position for optional resume."""
-        self.transition_to(InterruptState.INTERRUPTED_SPEECH)
-        self.interrupted_position = position_text
-        self.interrupted_context = context or {}
+        with self._lock:
+            self._interrupt_state = InterruptState.INTERRUPTED_SPEECH
+            self.interrupted_position = position_text
+            self.interrupted_context = context or {}
         print(f"   ⚡ [Interrupt] Speech aborted at: \"...{position_text[-40:]}\"")
         self.transition_to(InterruptState.FOLLOW_UP)
 
@@ -189,9 +219,17 @@ class StateManager:
 
     def reset_interrupt(self):
         """Clear all interrupt state when starting a new command."""
-        self.interrupt_state = InterruptState.IDLE
-        self.interrupted_position = ""
-        self.interrupted_context = {}
+        with self._lock:
+            self._interrupt_state = InterruptState.IDLE
+            self.interrupted_position = ""
+            self.interrupted_context = {}
+
+    def invalidate_system_cache(self):
+        """Call when persona, overthinking mode, or tool_max changes."""
+        with self._lock:
+            self._static_system_content = None
+            self._cached_persona = None
+            self._cached_overthinking = None
 
 
 # =================================================================
@@ -202,6 +240,8 @@ class InternalCommandProcessor:
     Handles hardcoded shortcut commands (startup video, language mode, etc.)
     before the LLM even sees the input. Acts as a pre-filter.
     """
+
+    IGNORE_KEYWORDS = frozenset(['hello', 'hi', 'hey'])
 
     def __init__(self, jarvis_core):
         self.jarvis = jarvis_core
@@ -217,8 +257,14 @@ class InternalCommandProcessor:
             # --- Settings Panel ---
             'nexus panel':               self._open_settings,
             'settings panel':            self._open_settings,
-            'show settings':       self._open_settings,
+            'show settings':             self._open_settings,
             'show panel':                self._open_settings,
+            
+            # --- Results Panel Synonyms ---
+            'results panel on':          lambda: self._set_results_panel(True),
+            'show results':              lambda: self._set_results_panel(True),
+            'open results':              lambda: self._set_results_panel(True),
+            'enable results panel':      lambda: self._set_results_panel(True),
             
             # --- Always Listening Synonyms ---
             'always listening on':       lambda: self._set_always_listening(True),
@@ -259,12 +305,17 @@ class InternalCommandProcessor:
     def process(self, command: str) -> Tuple[bool, Optional[str]]:
         command_lower = command.lower().strip()
 
-        # 1. New Guard: Ignore common short greetings from fuzzy matching
-        ignore_keywords = ['hello', 'hi', 'hey']
-        if any(command_lower == kw or command_lower == f"{kw} jarvis" for kw in ignore_keywords):
+        # 1. Ignore common short greetings from fuzzy matching 
+        base = command_lower.replace("jarvis", "").strip()
+        if base in self.IGNORE_KEYWORDS:
             return False, None
 
-        # 2. Strict Fuzzy matching
+        # 2. Direct dictionary lookup for exact match
+        if command_lower in self.commands:
+            print(f"🪄 [System] Exact matched: '{command_lower}'")
+            return True, self.commands[command_lower]()
+
+        # 3. Strict Fuzzy matching fallback
         try:
             available_commands = list(self.commands.keys())
             
@@ -348,6 +399,23 @@ class InternalCommandProcessor:
             
         return "Opening settings panel."
 
+    def _set_results_panel(self, enabled: bool) -> str:
+        from core.config import config
+        config.set('results_panal', enabled)
+        if enabled:
+            try:
+                import subprocess
+                import sys
+                if getattr(sys, 'frozen', False):
+                    subprocess.Popen([sys.executable, "--results"])
+                else:
+                    subprocess.Popen([sys.executable, "app.py", "--results"])
+            except Exception as e:
+                logger.error(f"[System] Error opening results panel: {e}")
+            return "Results panel ENABLED and opened."
+        else:
+            return "Results panel DISABLED. (Please close the window manually if open)"
+
 # =================================================================
 # JARVIS Core (Orchestrator)
 # =================================================================
@@ -366,9 +434,7 @@ class JARVISCore:
 
         # Component placeholders (filled during initialize())
         self.ears         = None
-        self.mouth = None
-
-
+        self.mouth        = None
 
         # Build phase state for UI integration
         self._build_phase = ""
@@ -388,11 +454,18 @@ class JARVISCore:
         self._is_currently_speaking_tool_intro     = False
         self.last_speech_time                      = 0.0
         self.pending_command                       = ""
+        self.active_live_feed                      = None
 
         # Tracked by WatchDog for Golden Opportunity pre-generation
         self._llm_busy = False
         self._llm_free_event = threading.Event()
         self._llm_free_event.set()  # Free by default
+
+        # Tracked by WatchDog._is_golden_moment() to enforce 15s quiet period
+        # in always_listening mode before delivering proactive reminders.
+        self._last_user_input_time = 0.0
+
+        self._abort_event = threading.Event()
 
         print("\n🔧 Initializing components...")
 
@@ -472,13 +545,12 @@ class JARVISCore:
                             "model": self.llm_client.normal_model,
                             "messages": warmup_messages,
                             "stream": False,  #? (Hmody: change it and u will regret it)    *it taked from me 3h to discover what happend 
-                            "keep_alive": get_setting('llm_keep_alive_high_perf', '15m'),
-                            # Only send tools schema if the model supports native tool calling
-                            "tools": warmup_tools if self.llm_client.supports_native_tools else None,
+                            "keep_alive": f"{get_setting('llm_keep_alive_high_perf', 15)}m",
+                            "tools": warmup_tools,
                             "options": {
                                 "temperature": 0.1,
                                 "num_predict": 1,
-                                "num_ctx": get_setting('llm_context_window', 4096)
+                                "num_ctx": get_setting('llm_context_window', 6144)
                             }
                         }
                         if warmup_system:
@@ -489,6 +561,14 @@ class JARVISCore:
                             json=test_payload, 
                             timeout=get_setting('warmup_timeout', 60)
                         )
+                        
+                        if response.status_code == 400 and "tool" in response.text.lower():
+                            error_msg = f"Model '{self.llm_client.normal_model}' does NOT support Native JSON Tools! JARVIS v1.3 requires native tools."
+                            print(f"   [System] ❌ FATAL: {error_msg}")
+                            logger.error(error_msg)
+                            break
+                            
+                        response.raise_for_status()  # Force HTTP errors to trigger the except block and sleep
                         
                         if response.ok:
                             print("   [System] 🔥 LLM Pre-ignition & Immutable Cache complete. Ready for instant replies.")
@@ -561,7 +641,7 @@ class JARVISCore:
     # Tool Execution Helpers
     # ------------------------------------------------------------------
     def get_available_tools(self) -> List[Dict]:
-        return self.tool_registry.get_all_schemas()
+        return self.tool_registry.get_all_minified_schemas()
 
     def execute_tool(self, tool_name: str, arguments: Dict) -> str:
         success, result_message = self.tool_registry.execute_tool(tool_name, arguments)
@@ -570,22 +650,12 @@ class JARVISCore:
     def _get_minified_tools(self) -> list:
         """Single source of truth for minified tool schemas."""
         if not hasattr(self, '_cached_minified_tools') or self._cached_minified_tools is None:
-            raw_tools = self.get_available_tools()
-            minified = []
-            for schema in raw_tools:
-                clean = json.loads(json.dumps(schema))
-                try:
-                    props = clean.get("function", {}).get("parameters", {}).get("properties", {})
-                    for _, details in list(props.items()):
-                        if "description" in details:
-                            desc = details["description"]
-                            if "CRITICAL" not in desc and "Required" not in desc:
-                                del details["description"]
-                except Exception:
-                    pass
-                minified.append(clean)
-            self._cached_minified_tools = minified
+            self._cached_minified_tools = self.tool_registry.get_all_minified_schemas()
         return self._cached_minified_tools
+
+    def _invalidate_tool_cache(self):
+        """Call when tools are registered/unregistered."""
+        self._cached_minified_tools = None
 
     # =================================================================
     # Audio Cues & Background Generation Methods
@@ -629,12 +699,18 @@ class JARVISCore:
 
         self.play_processing_cue()
 
-        system = (
-            "You are a concise voice assistant. "
-            "Output ONE plain spoken sentence only. "
-            "No XML tags, no <verbal>, no preamble. Just the sentence."
-        )
-        messages = [{'role': 'user', 'content': prompt}]
+        # Prefix Caching Preservation
+        static_system_payload, _ = self.build_messages(prompt)
+        # MODIFIED: [QA & Engineering] Cut 2,500 wasted tokens from background task and prevent tool hallucination
+        tools_payload = None
+
+        messages = [{
+            'role': 'user',
+            'content': (
+                f"[BACKGROUND PRE-GENERATION TASK]: {prompt}\n"
+                "Instruction: Output ONE plain spoken sentence only. No XML tags, no <verbal>, no preamble. Just the sentence."
+            )
+        }]
 
         try:
             self._llm_busy = True
@@ -642,9 +718,9 @@ class JARVISCore:
 
             response = self.llm_client.generate_response(
                 messages,
-                system_prompt=system,
+                system_prompt=static_system_payload,
                 is_overthinking=False,
-                tools=None,
+                tools=tools_payload,
                 temperature=0.1
             )
 
@@ -661,39 +737,48 @@ class JARVISCore:
         finally:
             self._llm_busy = False
             self._llm_free_event.set()
- 
+
+
+
     # =================================================================
     # Message Builder (KV-Cache Prefix Matching Optimized) #? (Hmody: look how beauty it looks)
     # =================================================================
     def build_messages(self, user_input: str) -> Tuple[str, List[Dict]]:
-        from core.config import config, SYSTEM_PROMPT, TOOL_RULES, OVER_THINKING_PROMPT, QUICK_MODE_PROMPT, NATIVE_JSON_PROMPT
+        from core.config import config, APP_VERSION, SYSTEM_PROMPT, TOOL_RULES, OVER_THINKING_PROMPT, QUICK_MODE_PROMPT, NATIVE_JSON_PROMPT, TAG_REMINDER_PROMPT
         from datetime import datetime
 
         current_assistant_name = config.get('assistant_name', 'Jarvis')
         current_tool_maximum = config.get('tool_maximum', 3)
         
         # Cache persona lookup - only re-fetch from DB when explicitly changed
-        active_persona = self.state._cached_persona
+        with self.state._lock:
+            active_persona = self.state._cached_persona
+            current_overthinking = self.state.overthinking_mode
+            
         if active_persona is None:
             active_persona = config.get_active_persona()
-            self.state._cached_persona = active_persona
-        
-        current_overthinking = self.state.overthinking_mode
+            with self.state._lock:
+                self.state._cached_persona = active_persona
         
         # =================================================================
         # 🟢 THE IMMUTABLE LAYER (Role: System)
         # =================================================================
         # Only rebuild the system prompt when overthinking_mode, persona, or tool_maximum change
-        if (self.state._static_system_content is None 
-            or self.state._cached_overthinking != current_overthinking
-            or getattr(self.state, '_cached_tool_maximum', None) != current_tool_maximum):
-            
-            self.state._cached_overthinking = current_overthinking
-            self.state._cached_tool_maximum = current_tool_maximum 
+        with self.state._lock:
+            cache_invalid = (
+                self.state._static_system_content is None 
+                or self.state._cached_overthinking != current_overthinking
+                or getattr(self.state, '_cached_tool_maximum', None) != current_tool_maximum
+            )
+
+        if cache_invalid:
+            with self.state._lock:
+                self.state._cached_overthinking = current_overthinking
+                self.state._cached_tool_maximum = current_tool_maximum 
             immutable_parts = []
             
             # 1. System Prompt
-            immutable_parts.append(SYSTEM_PROMPT.format(assistant_name=current_assistant_name))
+            immutable_parts.append(SYSTEM_PROMPT.format(assistant_name=current_assistant_name, app_version=APP_VERSION))
             
             # 2. Tool Rules 
             tool_rules_clean = TOOL_RULES.replace("{user_loc}", "Check Dynamic Context for Location")
@@ -713,17 +798,17 @@ class JARVISCore:
             else:
                 immutable_parts.append(QUICK_MODE_PROMPT)
                 
-            # 6. System Info
+            # 6. System Info (Trimmed down to true immutable OS state)
             immutable_parts.append(
                 "[SYSTEM INFO]\n"
-                "Architecture: JARVIS NEXUS, developed by VANT company, and open source community\n"
-                f"OS Environment: {self.state.os_type}\n"
-                f"Location: {self.state.user_location}"
+                f"OS Environment: {self.state.os_type}"
             )
 
-            self.state._static_system_content = "\n\n".join(immutable_parts)
+            with self.state._lock:
+                self.state._static_system_content = "\n\n".join(immutable_parts)
 
-        static_system_content = self.state._static_system_content
+        with self.state._lock:
+            static_system_content = self.state._static_system_content
 
         # =================================================================
         # 🟡 THE HISTORICAL LAYER (Roles: User / Assistant)
@@ -731,9 +816,17 @@ class JARVISCore:
         messages = []
 
         # A. Fetch previous Chat History
-        history_limit = get_setting('history_limit', 6)
-        if len(self.chat_history) > history_limit:
-            messages.extend(self.chat_history[-history_limit:])
+        # MODIFIED: history_limit now represents TURNS (1 turn = 1 user + 1 assistant pair).
+        # We enforce pairing to prevent orphan messages that confuse the LLM.
+        history_turns = get_setting('history_limit', 3)
+        max_messages = history_turns * 2
+        # Ensure we slice on an even boundary starting from a user message
+        if len(self.chat_history) > max_messages:
+            sliced = self.chat_history[-max_messages:]
+            # If the first sliced message is an assistant (orphan), drop it to start clean on a user turn
+            if sliced and sliced[0]['role'] == 'assistant':
+                sliced = sliced[1:]
+            messages.extend(sliced)
         else:
             messages.extend(self.chat_history)
 
@@ -783,11 +876,15 @@ class JARVISCore:
                 _last_path_filename = _last_path.rstrip('/').split('/')[-1] if _last_path else ""
                 _last_path_str = f" | target_file={_last_path_filename}" if _last_path_filename else ""
 
+        # NEW: Passed minimal prompt since formatting rules are already in System Prompt
+        _active_tag_reminder = TAG_REMINDER_PROMPT.format(verbal_limit_rule="Keep <verbal> natural and within active mode limits.")
+
+        # NEW: Stripped behavioral spam ('use time/loc ONLY if...') to prevent history token inflation
         final_user_content = (
             f"{dynamic_header}"
             f"--- USER MESSAGE ---\n{user_input}\n"
-            f"[sys: time={current_time} | loc={user_location}{_last_path_str} | user={safe_user_name} | "
-            f"use time/loc/user ONLY if user explicitly asks, do NOT volunteer it]"
+            f"[sys: time={current_time} | loc={user_location}{_last_path_str} | user={safe_user_name}]\n"
+            f"{_active_tag_reminder}"
         )
         
         messages.append({'role': 'user', 'content': final_user_content})
@@ -798,6 +895,9 @@ class JARVISCore:
     # Process Command (Interrupt-Aware Agentic Loop)
     # ------------------------------------------------------------------
     def process_command(self, command: str) -> str:
+        # Stamp user input time for WatchDog._is_golden_moment() gate
+        self._last_user_input_time = time.time()
+
         # Reset interrupt state at the start of every new command cycle
         self.state.reset_interrupt()
         
@@ -808,20 +908,25 @@ class JARVISCore:
         if is_internal:
             return response
 
-        # Engine-Level Permission Auto-Grant
-        _AFFIRMATIVE = {'yes', 'yeah', 'yep', 'sure', 'go on', 'go ahead', 'do it', 'proceed',
-                        'approved', 'granted', 'permission granted', 'you have my permission',
-                        'u have my permission', 'i agree', 'ok', 'okay', 'confirm', 'confirmed',
-                        'allow', 'allow it', 'accept'}
+        _AFFIRMATIVE = frozenset({
+            'yes', 'yeah', 'yep', 'sure', 'go on', 'go ahead', 'do it', 'proceed',
+            'approved', 'granted', 'permission granted', 'you have my permission',
+            'u have my permission', 'i agree', 'ok', 'okay', 'confirm', 'confirmed',
+            'allow', 'allow it', 'accept'
+        })
         cmd_clean = command.lower().strip(' ,.!?')
         
         auto_resume_feedback = ""
         
-        if self.state.pending_tool_call and any(af in cmd_clean for af in _AFFIRMATIVE):
+        pending = None
+        with self.state._lock:
             pending = self.state.pending_tool_call
+        
+        if pending and any(af in cmd_clean for af in _AFFIRMATIVE):
             tool_name = pending['name']
             tool_args = pending['args']
-            self.state.pending_tool_call = None
+            with self.state._lock:
+                self.state.pending_tool_call = None
             
             # Auto-grant permission for this tool (and its group siblings)
             from core.tools.default_tools import _handle_grant_permission
@@ -896,10 +1001,12 @@ class JARVISCore:
                 chunk_clean = chunk.strip()
                 if not chunk_clean: return
                 
-                if bool(re.search(r'(?i)^<reasoning|^<tool_call|^\{', chunk_clean)):
+                if bool(re.search(r'(?i)^<(?!/?verbal)[a-z_]+|^\{', chunk_clean)):
                     return
 
-                speak_text = re.sub(r'(?i)</?verbal>', '', chunk_clean).strip()
+                speak_text = re.sub(r'(?i)</?verbal>', '', chunk_clean)
+                speak_text = re.sub(r'(?i)<[a-z_]+\s*[^>]*>', '', speak_text)
+                speak_text = speak_text.strip()
 
                 if speak_text and speak_text.upper() != "NONE":
                     instant_spoken_chunks.append(speak_text)
@@ -917,7 +1024,7 @@ class JARVISCore:
 
                 _tool_announced.clear()
                 _loop_label = f"[LOOP {_current_iter_idx}/{max_iterations}]"
-                abort_event = threading.Event()
+                self._abort_event.clear()
 
                 def on_background_speech(audio_np):
                     text = self.ears.transcribe(audio_np, initial_prompt="Listen carefully.")
@@ -944,7 +1051,7 @@ class JARVISCore:
                             return
 
                     if has_trigger:
-                        abort_event.set()
+                        self._abort_event.set()
                         self.mouth.stop_speaking()
                         
                         match = self.ears.wake_word_pattern.search(text)
@@ -956,8 +1063,8 @@ class JARVISCore:
                                 self.pending_command = "SYSTEM_WAKE"
 
                 def delayed_listener_start():
-                    abort_event.wait(timeout=0.5)
-                    if not abort_event.is_set():
+                    self._abort_event.wait(timeout=0.5)
+                    if not self._abort_event.is_set():
                         self.ears.start_background_listening(on_background_speech)
                 
                 listener_thread = threading.Thread(target=delayed_listener_start, daemon=True)
@@ -971,6 +1078,25 @@ class JARVISCore:
                     if self.state.overthinking_mode else 0.1
                 )
 
+                from core.config import config
+                if config.get('results_panal', False):
+                    try:
+                        from core.ui.results_viewer import LiveFeed
+                        import subprocess
+                        import sys
+                        
+                        def launch_viewer():
+                            if getattr(sys, 'frozen', False):
+                                subprocess.Popen([sys.executable, "--results-live"])
+                            else:
+                                subprocess.Popen([sys.executable, "app.py", "--results-live"])
+
+                        self.active_live_feed = LiveFeed(on_first_chunk=launch_viewer)
+                    except Exception as e:
+                        logger.error(f"[System] Live Viewer Error: {e}")
+                else:
+                    self.active_live_feed = None
+
                 llm_response = self.llm_client.generate_response(
                     messages,
                     system_prompt=static_system_payload,
@@ -978,9 +1104,10 @@ class JARVISCore:
                     tools=tools_payload,
                     temperature=_active_temperature,
                     line_callback=stream_interpreter,
-                    abort_event=abort_event,
+                    abort_event=self._abort_event,
                     on_tool_start_callback=on_tool_start,
-                    ttft_anchor=_ttft_anchor
+                    ttft_anchor=_ttft_anchor,
+                    result_chunk_callback=self.active_live_feed.send if self.active_live_feed else None
                 )
 
                 self.ears.stop_background_listening()
@@ -1012,6 +1139,65 @@ class JARVISCore:
                 for chunk in instant_spoken_chunks:
                     remainder_text = remainder_text.replace(chunk, "", 1)
                 
+                # --- Process <result> tags ---
+                def process_result_tags(text: str) -> str:
+                    pattern = r'<result>(.*?)(?:</result>|$)'
+                    matches = list(re.finditer(pattern, text, re.DOTALL | re.IGNORECASE))
+                    
+                    if not matches:
+                        # Fallback: if the LLM output <result> but no content yet or failed to match properly
+                        if '<result>' in text.lower():
+                            return re.sub(r'(?i)<result>.*$', '', text, flags=re.DOTALL).strip()
+                        return text
+
+                    from core.config import get_setting, SHARE_DIR
+                    results_dir_str = config.get('results_dir')
+                    if results_dir_str:
+                        results_dir = Path(results_dir_str)
+                    else:
+                        results_dir = Path(get_setting('results_dir', str(SHARE_DIR / 'results')))
+                        
+                    results_dir.mkdir(parents=True, exist_ok=True)
+
+                    for match in matches:
+                        block_content = match.group(1).strip()
+                        if not block_content:
+                            continue
+                        
+                        # Extract first line as file title
+                        first_line = block_content.split('\n', 1)[0].strip()
+                        if first_line.lower().endswith('.md'):
+                            base_name = first_line[:-3]
+                        else:
+                            base_name = first_line.split()[0]
+                            
+                        safe_title = "".join(c for c in base_name if c.isalnum() or c in ('_', '-'))
+                        if not safe_title:
+                            safe_title = f"result_{int(time.time())}"
+                            
+                        date_str = datetime.now().strftime("%d%m%Y")
+                        filename = f"{safe_title}_{date_str}_result.md"
+                        file_path = results_dir / filename
+                        
+                        # Call the write_file tool directly as instructed
+                        self.execute_tool('write_file', {
+                            'file_path': str(file_path),
+                            'content': block_content,
+                            'override_permission': True
+                        })
+                        print(f"📄 [Result] Saved via write tool to: {file_path}")
+                        
+                        if getattr(self, 'active_live_feed', None):
+                            try:
+                                self.active_live_feed.signal_done(filename)
+                            except Exception:
+                                pass
+
+                    clean_text_no_results = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    return clean_text_no_results
+
+                remainder_text = process_result_tags(remainder_text)
+                
                 remainder_text = re.sub(r'(?i)</?verbal>', '', remainder_text).strip()
                 
                 if remainder_text and remainder_text.upper() != "NONE":
@@ -1042,7 +1228,7 @@ class JARVISCore:
                         )
                         messages.append({'role': 'assistant', 'content': clean_text.strip()})
                         messages.append({'role': 'user', 'content': (
-                            f"[SYSTEM FEEDBACK]\\n"
+                            f"[SYSTEM FEEDBACK]\n"
                             f"System: You announced intent but emitted NO tool call. {_feedback_hint} "
                             f"Do NOT repeat your announcement text."
                         )})
@@ -1077,17 +1263,23 @@ class JARVISCore:
                     try:
                         result = self.execute_tool(tool_name, func_args)
                         
-                        if tool_name == 'grant_temporary_permission' and "granted" in str(result).lower() and self.state.pending_tool_call:
+                        pending = None
+                        with self.state._lock:
+                            pending = self.state.pending_tool_call
+                            
+                        if tool_name == 'grant_temporary_permission' and "granted" in str(result).lower() and pending:
                             tool_results_combined.append(f"System: Tool '{tool_name}' executed. Result:\n{result}")
-                            auto_name = self.state.pending_tool_call['name']
-                            auto_args = self.state.pending_tool_call['args']
-                            self.state.pending_tool_call = None
+                            auto_name = pending['name']
+                            auto_args = pending['args']
+                            with self.state._lock:
+                                self.state.pending_tool_call = None
                             auto_res = self.execute_tool(auto_name, auto_args)
                             tool_results_combined.append(f"System: Auto-resumed blocked Tool '{auto_name}' seamlessly. Result:\n{auto_res}")
                             continue
                         
                         if isinstance(result, str) and "Security Block" in result:
-                            self.state.pending_tool_call = {'name': tool_name, 'args': func_args}
+                            with self.state._lock:
+                                self.state.pending_tool_call = {'name': tool_name, 'args': func_args}
                             result = f"Security Block: Action '{tool_name}' requires permission. Ask the user. If they agree, you MUST call 'grant_temporary_permission' in your NEXT turn to auto-resume."
                         
                         if isinstance(result, str) and len(result) > 800:
@@ -1097,7 +1289,7 @@ class JARVISCore:
 
                     tool_results_combined.append(f"System: Tool '{tool_name}' executed. Result:\n{result}")
 
-                    if tool_name in SILENT_TOOLS and "Error:" not in result and "Failed" not in result and "Security Block" not in result:
+                    if self.tool_registry.is_silent_tool(tool_name) and "Error:" not in result and "Failed" not in result and "Security Block" not in result:
                         silent_success_count += 1
 
                 _executed_names = [
@@ -1106,7 +1298,7 @@ class JARVISCore:
                 ]
                 _all_free = (
                     bool(_executed_names)
-                    and all(n in FREE_TOOLS for n in _executed_names)
+                    and all(self.tool_registry.is_free_tool(n) for n in _executed_names)
                 )
 
                 _all_errors = tool_results_combined and all(
@@ -1196,9 +1388,11 @@ class JARVISCore:
             self.chat_history.append({'role': 'user', 'content': command})
             self.chat_history.append({'role': 'assistant', 'content': compressed_response})
 
-            history_limit = get_setting('history_limit', 6)
-            if len(self.chat_history) > history_limit:
-                self.chat_history = self.chat_history[-history_limit:]
+            # MODIFIED: history_limit now = TURNS. Keep (turns * 2) messages, paired.
+            history_turns = get_setting('history_limit', 3)
+            max_messages = history_turns * 2
+            if len(self.chat_history) > max_messages:
+                self.chat_history = self.chat_history[-max_messages:]
                 self.state.clear_temp_memory()
 
             if final_unspoken_text:
@@ -1287,6 +1481,9 @@ class JARVISCore:
                     window_limit = get_setting('followup_window', 10)
                     is_in_window = (time.time() - self.last_speech_time) <= window_limit
 
+                    if not is_in_window and self.state.interrupt_state == InterruptState.FOLLOW_UP:
+                        self.state.transition_to(InterruptState.IDLE)
+
                     raw_text = self.ears.listen()
                     if not raw_text:
                         continue
@@ -1320,17 +1517,28 @@ class JARVISCore:
                                 if model:
                                     requests.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
                                     print(f"🧹 Unloaded model '{model}' from RAM.")
-                            
-                            import subprocess
-                            if platform.system() == "Windows":
-                                subprocess.run("taskkill /F /IM ollama.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                subprocess.run("taskkill /F /IM ollama_llama_server.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            else:
-                                subprocess.run(["pkill", "-9", "-f", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    
+                            # MODIFIED: Removed reckless 'taskkill /F /IM ollama.exe' via shell=True. 
+                            # JARVIS does not own the Ollama process, so we just unload our models gracefully.
                         except Exception as e:
-                            print(f"⚠️ Failed to unload Ollama models or kill process: {e}")
+                            print(f"⚠️ Failed to unload Ollama models: {e}")
+                        
+                        # MODIFIED: Graceful cleanup of daemon threads before killing to avoid zombies
+                        if hasattr(self, 'ears'):
+                            self.ears.run_hardware_thread = False
+                        if hasattr(self, 'watch_dog'):
+                            self.watch_dog.stop()
+                            
                         self.running = False
-                        break
+                        
+                        # Graceful WAL Checkpoint before exiting
+                        from core.config import config
+                        config.force_wal_checkpoint()
+                        if hasattr(self, 'memory') and self.memory:
+                            self.memory.force_wal_checkpoint()
+                            
+                        import sys
+                        sys.exit(0)
 
                     print(f"🚀 Executing: {command}")
                     self._is_currently_speaking_tool_intro = False
@@ -1388,15 +1596,14 @@ class JARVISCore:
                             if model:
                                 requests.post(f"{base_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=3)
                                 print(f"🧹 Unloaded model '{model}' from RAM.")
-                    
-                    import subprocess
-                    if platform.system() == "Windows":
-                        subprocess.run("taskkill /F /IM ollama.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        subprocess.run("taskkill /F /IM ollama_llama_server.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.run(["pkill", "-9", "-f", "ollama"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                
+                        # MODIFIED: Removed reckless 'taskkill /F /IM ollama.exe' via shell=True.
                 except Exception as e:
-                    print(f"⚠️ Failed to unload Ollama models or kill process: {e}")
+                    print(f"⚠️ Failed to unload Ollama models: {e}")
+                
+                # MODIFIED: Clean up STT thread before loop break
+                if hasattr(self, 'ears'):
+                    self.ears.run_hardware_thread = False
                 self.running = False
                 break
             except Exception as e:

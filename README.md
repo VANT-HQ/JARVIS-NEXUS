@@ -9,7 +9,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLM-000000?style=for-the-badge)](https://ollama.com)
-[![Status](https://img.shields.io/badge/Status-%20v1.1-brightgreen?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases)
+[![Status](https://img.shields.io/badge/Status-%20v1.3-brightgreen?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases)
 [![Download EXE](https://img.shields.io/badge/Download-Windows%20.exe-blue?style=for-the-badge&logo=windows)](https://github.com/VANT-HQ/JARVIS-NEXUS/releases/latest)
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome%20on%20dev-0075ca?style=for-the-badge)](https://github.com/VANT-HQ/JARVIS-NEXUS/tree/dev)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=for-the-badge)](#-hardware-requirements)
@@ -38,15 +38,36 @@ While competitors demand 8GB+ VRAM for agentic workflows, **NEXUS is meticulousl
 
 What sets it apart is the **NEXUS Architecture**: a dual-layer message system that pre-bakes the system prompt and tool schemas into Ollama's KV-Cache at startup, achieving near-zero TTFT on every interaction — even the very first one.
 
-## 🚀 What's New in v1.1 (Stability & Executable Update)
-<!--? (Hmody: admit it was a bugs  ❌, we are introducing to you the v1.1 release🎉  ✅) -->
-This release focuses heavily on deep architectural improvements to ensure flawless, crash-free execution in the compiled `Windowless Executable (.exe)` environment.
+## 🚀 What's New in v1.3 (Architecture Audit & Token Optimization)
 
-* **Deterministic Boot Sequence:** Removed fragile timeouts. JARVIS now waits for actual LLM readiness with strict null-safety, guaranteeing 100% boot reliability without `NoneType` crashes.
-* **Subprocess Isolation:** Background operations (like Ollama) are now fully isolated with outputs routed to `DEVNULL`. This permanently eliminates buffer-overflow deadlocks and freezing in the standalone executable.
-* **Thread-Safe GUI Fallbacks:** Replaced crash-prone `tkinter` daemon-thread calls with a smart PowerShell/WinForms fallback, preventing system freezes during model rebuild prompts.
-* **Interactive System Tray:** The tray icon now features live state syncing (e.g., *Building Model*, *Warming Cache*), Quick/Full Restart options, and a context-aware, guard-protected "Rebuild Model" action.
-* **CUDA Environment Inheritance:** Background processes now perfectly inherit system environment variables (`os.environ.copy()`), ensuring Ollama reliably detects your GPU even when launched via the silent background daemon.
+This release focuses entirely on stabilizing the core experience, proactively patching security vulnerabilities, and resolving deep architectural issues. It represents a major overhaul across concurrency, memory safety, context-window efficiency, and introduces a dedicated visual results engine.
+
+**🔄 Concurrency Overhaul**
+* `settings.db` now runs in `WAL` mode with `busy_timeout`.
+* All memory/state locks converted to `RLock`, eliminating deadlocks between the WatchDog and main engine.
+* `_get_embedding()` network calls moved outside the DB lock entirely.
+
+**🛡️ Security Hardening**
+* Removed every `shell=True` subprocess call (Command Injection surface closed).
+* Emergency shutdown no longer runs `taskkill /F /IM ollama.exe` — it now sends `keep_alive: 0` via the API so it never touches processes JARVIS didn't spawn.
+
+**🧠 Token & VRAM Diet**
+* Consolidated 11 overlapping OS tools into 4 (`adjust_hardware`, `open_browser_visuals`, `manage_desktop_apps`, `mutate_filesystem`) with backward-compatible alias fallback.
+* Stripped redundant prompt injections and disabled tool-schema payloads on background pre-generation.
+* Combined savings of ~800+ tokens/turn and ~2.5k tokens on every reminder call.
+
+**🐕 WatchDog Rebuild**
+* Fixed the infinite `MISSED` task loop (was calling a non-existent `update_task`).
+* Reverted reminder injection into `chat_history` that was destroying KV-Cache and blowing TTFT from 9s to 71s.
+* Merged the standalone RAM-sync thread into the main monitor loop.
+
+**📺 New UI & Results Engine**
+* **Results Viewer (New Screen):** Introduced a dedicated new display screen for rendering visual tool data, structured outputs, and interactive content cleanly.
+* **`<result>` Tag Support:** A newly engineered tag system allows tools to directly emit visual data to the UI without confusing the LLM context or bleeding into TTS/chat history.
+
+**🔌 Stability Fixes**
+* **Clean Shutdown Path:** Replaced forced `os._exit(0)` with `sys.exit(0)` plus an explicit `PRAGMA wal_checkpoint(TRUNCATE)`, preventing WAL/SHM corruption on exit while still killing zombie STT/WatchDog threads.
+* **Streaming/TTS Fixes:** `<result>` and `<reasoning>` tags can no longer leak into speech even when split across stream chunks. Visual/media tool calls are now barred from emitting `<result>` blocks that were incorrectly popping the Results Viewer.
 
 <!-- > 🌐 **For the full technical changelog and deep-dive details, visit [vanthq.net/jarvisnexus](https://vanthq.net/jarvisnexus).** -->
 <!--? (Hmody: i cant do more code, i realy need a break 😭😭😭) -->
@@ -431,6 +452,8 @@ JARVIS-NEXUS/
 │   │   └── utils.py              # Core utilities (Mutex, single instance enforcement)
 │   └── ui/
 │       ├── settings_panel.py     # Settings GUI (webview — live Python ↔ JS bridge)
+│       ├── results_viewer.py     # Dedicated visual screen for structured tool outputs
+│       ├── tray_icon.py          # Interactive System Tray fallback & state monitor
 │       └── video_player.py       # Isolated PyQt5 video player process
 ├── data/
 │   ├── memories.db               # Memory database (auto-created on first run)
@@ -444,7 +467,11 @@ JARVIS-NEXUS/
 │   ├── sounds/                   # Processing and listening audio cues
 │   └── tts/                      # Piper TTS voice data
 ├── logs/                         # Auto-cleaned log files (24h retention)
-└── cache/                        # Runtime cache (FAISS index, app cache)
+├── cache/                        # Runtime cache (FAISS index, app cache)
+└── tests/                        # System evaluation and stability tests
+    ├── results/                  # Archived test results output
+    ├── test/                     # Test files
+    └── test.md                   # Evaluation documentation
 ```
 
 ---

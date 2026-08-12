@@ -51,8 +51,14 @@ class VideoPlayer:
             return False
 
         if self.current_process and self.current_process.poll() is None:
-            print("⚠️ [Visual System] Video sequence is already active. Skipping duplicate request.")
-            return False
+            # MODIFIED: Kill zombie process instead of silently skipping — prevents process accumulation
+            print("⚠️ [Visual System] Active sequence detected. Forcing clean termination...")
+            try:
+                self.current_process.kill()
+                self.current_process.wait(timeout=2.0)
+            except Exception:
+                pass
+            self.current_process = None
 
         video_file = Path(video_path)
         
@@ -99,8 +105,13 @@ class VideoPlayer:
             )
 
             if blocking:
-                # Wait naturally for the process to finish on its own terms (No timeout)
-                self.current_process.wait()
+                # MODIFIED: Added 120s timeout boundary — a hung codec can't freeze JARVIS indefinitely
+                try:
+                    self.current_process.wait(timeout=120.0)
+                except subprocess.TimeoutExpired:
+                    print(f"⚠️ [Visual System] Video sequence timed out (>120s). Forcefully terminating mpv.")
+                    self.current_process.kill()
+                    self.current_process.wait()
                 
                 # Cleanup failsafe if the process somehow hangs
                 if self.current_process.poll() is None:
