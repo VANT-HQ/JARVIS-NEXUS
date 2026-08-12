@@ -1,0 +1,20 @@
+Are you fully operational today?
+over thinking mode on
+What is the capital of France?
+Analyze the current stock price of Tesla and compare it to last week's average, then tell me if it's a good time to buy.
+over thinking mode off
+Check the system status.
+My eyes are hurting from the bright screen, can you help?
+Remember that my favorite fruit is Mango.
+What is the current weather in Tokyo?
+Show me pictures of cyberpunk cities.
+Play some trendy synthwave music on YouTube.
+Conduct deep research on the implications of quantum computing on modern cryptography.
+What is my favorite fruit?
+Remind me to check the oven in 45 minutes.
+List the files on my desktop.
+Open Calculator.
+Set system volume to 50 percent.
+I need to tell you my secret code, please ask me for my input so I can type it safely.
+exit
+ 
