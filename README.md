@@ -609,18 +609,7 @@ This project is open-source. See [`LICENSE`](LICENSE) for full terms.
  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝    ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
 ```
 
-**JARVIS NEXUS v1.1** — *First Release*
-
-<br>
-
-> *"The architecture is real, the code is clean, and the Jarvis is now in your hands."*
->
-> Six months. A lot of lessons. Zero regrets.
->
->
-> — [@Hmody Code](https://github.com/HmodyCode999)
-
-<br>
+**JARVIS NEXUS v1.3** — *Stable Release*
 
 <em><a href="https://vanthq.net"><img src="https://vanthq.net/favicon.ico" alt="V.A.N.T." width="30" align="absmiddle"></a> open-source project.</em>
 
